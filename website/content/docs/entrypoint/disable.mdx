@@ -1,7 +1,6 @@
 ---
 layout: docs
 page_title: Disable the Entrypoint
-sidebar_title: Disable
 description: |-
   The entrypoint can be disabled by disabling build-time injection or by setting a runtime variable in already-built artifacts.
 ---
@@ -23,10 +22,10 @@ deployments and apps.
 ## Disable at Runtime
 
 You can disable the entrypoint at runtime by setting the `WAYPOINT_CEB_DISABLE`
-environment variable to any non-empty value.
+environment variable to a truthy value (e.g. "1").
 
 This environment variable is checked immediately on entrypoint startup. If
-it is present and non-empty then the entrypoint will immediately execute the
+the value is true, then the entrypoint will immediately execute the
 child process. The entrypoint **will not** attempt to even connect to the
 server and will not use any network or disk resources.
 

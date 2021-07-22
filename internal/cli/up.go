@@ -16,6 +16,9 @@ import (
 
 type UpCommand struct {
 	*baseCommand
+
+	flagPrune       bool
+	flagPruneRetain int
 }
 
 func (c *UpCommand) Run(args []string) int {
@@ -29,7 +32,13 @@ func (c *UpCommand) Run(args []string) int {
 	}
 
 	err := c.DoApp(c.Ctx, func(ctx context.Context, app *clientpkg.App) error {
-		result, err := app.Up(ctx, &pb.Job_UpOp{})
+		result, err := app.Up(ctx, &pb.Job_UpOp{
+			Release: &pb.Job_ReleaseOp{
+				Prune:               c.flagPrune,
+				PruneRetain:         int32(c.flagPruneRetain),
+				PruneRetainOverride: c.flagPruneRetain >= 0,
+			},
+		})
 		if c.legacyRequired(err) {
 			// An older Waypoint server version that doesn't support the
 			// "up" operation, so fall back.
@@ -46,18 +55,32 @@ func (c *UpCommand) Run(args []string) int {
 		appUrl := result.Up.AppUrl
 		deployUrl := result.Up.DeployUrl
 
+		// inplace is true if this was an in-place deploy. We detect this
+		// if we have a generation that uses a non-matching sequence number
+		inplace := result.Deploy.Deployment.Generation != nil &&
+			result.Deploy.Deployment.Generation.Id != "" &&
+			result.Deploy.Deployment.Generation.InitialSequence != result.Deploy.Deployment.Sequence
+
 		// Output
 		app.UI.Output("")
 		switch {
 		case releaseUrl != "":
-			app.UI.Output(strings.TrimSpace(deployURLService)+"\n", terminal.WithSuccessStyle())
+			if !inplace {
+				app.UI.Output(strings.TrimSpace(deployURLService)+"\n", terminal.WithSuccessStyle())
+			} else {
+				app.UI.Output(strings.TrimSpace(deployInPlace)+"\n", terminal.WithSuccessStyle())
+			}
 			app.UI.Output("   Release URL: %s", releaseUrl, terminal.WithSuccessStyle())
 			if deployUrl != "" {
 				app.UI.Output("Deployment URL: %s", deployUrl, terminal.WithSuccessStyle())
 			}
 
 		case appUrl != "" && deployUrl != "":
-			app.UI.Output(strings.TrimSpace(deployURLService)+"\n", terminal.WithSuccessStyle())
+			if !inplace {
+				app.UI.Output(strings.TrimSpace(deployURLService)+"\n", terminal.WithSuccessStyle())
+			} else {
+				app.UI.Output(strings.TrimSpace(deployInPlace)+"\n", terminal.WithSuccessStyle())
+			}
 			app.UI.Output("           URL: %s", appUrl, terminal.WithSuccessStyle())
 			app.UI.Output("Deployment URL: %s", deployUrl, terminal.WithSuccessStyle())
 
@@ -191,6 +214,24 @@ func (c *UpCommand) legacyUp(
 
 func (c *UpCommand) Flags() *flag.Sets {
 	return c.flagSet(flagSetOperation, func(set *flag.Sets) {
+		f := set.NewSet("Command Options")
+
+		f.BoolVar(&flag.BoolVar{
+			Name:    "prune",
+			Target:  &c.flagPrune,
+			Usage:   "Prune old unreleased deployments.",
+			Default: true,
+		})
+
+		f.IntVar(&flag.IntVar{
+			Name:   "prune-retain",
+			Target: &c.flagPruneRetain,
+			Usage: "The number of unreleased deployments to keep. " +
+				"If this isn't set or is set to any negative number, " +
+				"then this will default to 1 on the server. If you want to prune " +
+				"all unreleased deployments, set this to 0.",
+			Default: -1,
+		})
 	})
 }
 

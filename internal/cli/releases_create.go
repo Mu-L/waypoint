@@ -19,8 +19,10 @@ import (
 type ReleaseCreateCommand struct {
 	*baseCommand
 
-	flagRepeat     bool
-	flagDeployment string
+	flagRepeat      bool
+	flagDeployment  string
+	flagPrune       bool
+	flagPruneRetain int
 }
 
 func (c *ReleaseCreateCommand) Run(args []string) int {
@@ -130,7 +132,34 @@ func (c *ReleaseCreateCommand) Run(args []string) int {
 		// Release
 		result, err := app.Release(ctx, &pb.Job_ReleaseOp{
 			Deployment: deploy,
-			Prune:      true,
+
+			Prune:               c.flagPrune,
+			PruneRetain:         int32(c.flagPruneRetain),
+			PruneRetainOverride: c.flagPruneRetain >= 0,
+		})
+		if err != nil {
+			app.UI.Output(clierrors.Humanize(err), terminal.WithErrorStyle())
+			return ErrSentinel
+		}
+
+		// If the released deploy doesn't match what we requested, it is
+		// because they share a generation, meaning the release was a noop.
+		inplace := deploy.Generation != nil && deploy.Generation.Id != "" &&
+			deploy.Generation.InitialSequence != deploy.Sequence
+
+		if result.Release.DeploymentId != deploy.Id && inplace {
+			app.UI.Output(strings.TrimSpace(releaseMatchingGen)+"\n",
+				deploy.Sequence,
+				deploy.Component.Name,
+				terminal.WithWarningStyle())
+		}
+
+		// Status Report
+		app.UI.Output("")
+		_, err = app.StatusReport(ctx, &pb.Job_StatusReportOp{
+			Target: &pb.Job_StatusReportOp_Release{
+				Release: result.Release,
+			},
 		})
 		if err != nil {
 			app.UI.Output(clierrors.Humanize(err), terminal.WithErrorStyle())
@@ -163,11 +192,29 @@ func (c *ReleaseCreateCommand) Flags() *flag.Sets {
 			Usage:   "Re-release if deploy is already released.",
 			Default: false,
 		})
+
 		f.StringVar(&flag.StringVar{
 			Name:    "deployment",
 			Aliases: []string{"d"},
 			Target:  &c.flagDeployment,
 			Usage:   "Release the specified deployment.",
+		})
+
+		f.BoolVar(&flag.BoolVar{
+			Name:    "prune",
+			Target:  &c.flagPrune,
+			Usage:   "Prune old unreleased deployments.",
+			Default: true,
+		})
+
+		f.IntVar(&flag.IntVar{
+			Name:   "prune-retain",
+			Target: &c.flagPruneRetain,
+			Usage: "The number of unreleased deployments to keep. " +
+				"If this isn't set or is set to any negative number, " +
+				"then this will default to 1 on the server. If you want to prune " +
+				"all unreleased deployments, set this to 0.",
+			Default: -1,
 		})
 	})
 }
@@ -217,5 +264,15 @@ using "waypoint deploy" and try again.
 
 	releaseUpToDate = `
 The deployment %q is already the released deployment. Nothing to be done.
+`
+
+	releaseMatchingGen = `
+Warning: deployment v%[1]d is the same generation as the currently released
+deployment. This means v%[1]d is already released, since deployments
+with matching generations share the same underlying resources.
+
+This means that your deployment plugin %[2]q performed an in-place update.
+For plugins that perform in-place updates, you can only release deployments
+of a different generation.
 `
 )

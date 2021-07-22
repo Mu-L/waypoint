@@ -206,6 +206,7 @@ func (p *Platform) Deploy(
 
 	sess, err := utils.GetSession(&utils.SessionConfig{
 		Region: p.config.Region,
+		Logger: log,
 	})
 	if err != nil {
 		return nil, err
@@ -288,27 +289,45 @@ func (p *Platform) Deploy(
 	} else {
 		step.Update("Creating new Lambda function")
 
-		funcOut, err := lamSvc.CreateFunction(&lambda.CreateFunctionInput{
-			Description:  aws.String(fmt.Sprintf("waypoint %s", src.App)),
-			FunctionName: aws.String(src.App),
-			Role:         aws.String(roleArn),
-			Timeout:      aws.Int64(timeout),
-			MemorySize:   aws.Int64(mem),
-			Tags: map[string]*string{
-				"waypoint.app": aws.String(src.App),
-			},
-			PackageType: aws.String("Image"),
-			Code: &lambda.FunctionCode{
-				ImageUri: aws.String(img.Name()),
-			},
-			ImageConfig: &lambda.ImageConfig{},
-		})
+		// Run this in a loop to guard against eventual consistency errors with the specified
+		// role not showing up within lambda right away.
+		for i := 0; i < 30; i++ {
+			funcOut, err := lamSvc.CreateFunction(&lambda.CreateFunctionInput{
+				Description:  aws.String(fmt.Sprintf("waypoint %s", src.App)),
+				FunctionName: aws.String(src.App),
+				Role:         aws.String(roleArn),
+				Timeout:      aws.Int64(timeout),
+				MemorySize:   aws.Int64(mem),
+				Tags: map[string]*string{
+					"waypoint.app": aws.String(src.App),
+				},
+				PackageType: aws.String("Image"),
+				Code: &lambda.FunctionCode{
+					ImageUri: aws.String(img.Name()),
+				},
+				ImageConfig: &lambda.ImageConfig{},
+			})
 
-		if err != nil {
-			return nil, err
+			if err != nil {
+				// if we encounter an unrecoverable error, exit now.
+				if aerr, ok := err.(awserr.Error); ok {
+					switch aerr.Code() {
+					case "ResourceConflictException":
+						return nil, err
+					}
+				}
+
+				// otherwise sleep and try again
+				time.Sleep(2 * time.Second)
+			} else {
+				funcarn = *funcOut.FunctionArn
+				break
+			}
 		}
+	}
 
-		funcarn = *funcOut.FunctionArn
+	if funcarn == "" {
+		return nil, fmt.Errorf("Unable to create function, timed out trying")
 	}
 
 	step.Done()
@@ -378,6 +397,7 @@ func (p *Platform) Deploy(
 	// requires that the name is 32 characters or less.
 	if len(serviceName) > 32 {
 		serviceName = serviceName[:32]
+		log.Debug("using a shortened value for service name due to AWS's length limits", "serviceName", serviceName)
 	}
 
 	ctg, err := svc.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
@@ -603,6 +623,7 @@ func (p *Platform) Destroy(
 
 	sess, err := utils.GetSession(&utils.SessionConfig{
 		Region: p.config.Region,
+		Logger: log,
 	})
 	if err != nil {
 		return err
@@ -654,6 +675,7 @@ func (p *Platform) DestroyWorkspace(
 
 	sess, err := utils.GetSession(&utils.SessionConfig{
 		Region: p.config.Region,
+		Logger: log,
 	})
 	if err != nil {
 		return err

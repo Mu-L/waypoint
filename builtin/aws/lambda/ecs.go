@@ -97,6 +97,7 @@ func (e *ecsLauncher) SetupRole(L hclog.Logger, sess *session.Session, log hclog
 	// role names have to be 64 characters or less, and the client side doesn't validate this.
 	if len(e.roleName) > 64 {
 		e.roleName = e.roleName[:64]
+		L.Debug("using a shortened value for role name due to AWS's length limits", "roleName", e.roleName)
 	}
 
 	log.Info("setting up IAM role")
@@ -196,6 +197,7 @@ func (e *ecsLauncher) Launch(
 
 	sess, err := utils.GetSession(&utils.SessionConfig{
 		Region: e.Region,
+		Logger: L,
 	})
 	if err != nil {
 		return nil, err

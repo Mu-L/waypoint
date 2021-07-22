@@ -1,8 +1,14 @@
+{{page-title @model.name}}
+
 <PageHeader @iconName="folder-outline">
   <div class="title">
     <h1>{{@model.name}}</h1>
     <small>{{pluralize @model.applicationsList.length "application"}}</small>
   </div>
+  <Pds::CtaLink @route="workspace.projects.project.settings" @model={{@model.name}} @variant="ghost "class="pds--iconStart">
+    <Pds::Icon @type="settings" class="pds-button__iconStart"/>
+    &nbsp;Manage settings
+  </Pds::CtaLink>
 </PageHeader>
 
 {{#each @model.applicationsList as |app|}}

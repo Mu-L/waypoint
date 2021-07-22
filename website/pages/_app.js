@@ -5,7 +5,6 @@ import useAnchorLinkAnalytics from '@hashicorp/nextjs-scripts/lib/anchor-link-an
 import Router from 'next/router'
 import HashiHead from '@hashicorp/react-head'
 import HashiStackMenu from '@hashicorp/react-hashi-stack-menu'
-import Head from 'next/head'
 import AlertBanner from '@hashicorp/react-alert-banner'
 import createConsentManager from '@hashicorp/nextjs-scripts/lib/consent-manager'
 import { ErrorBoundary } from '@hashicorp/nextjs-scripts/lib/bugsnag'
@@ -29,17 +28,18 @@ export default function App({ Component, pageProps }) {
   return (
     <ErrorBoundary FallbackComponent={Error}>
       <HashiHead
-        is={Head}
         title={title}
         siteName={title}
         description={description}
         image="https://www.waypointproject.io/img/og-image.png"
-        icon={[{ href: '/favicon.ico' }]}
+        icon={[{ href: '/_favicon.ico' }]}
       >
         <meta name="og:title" property="og:title" content={title} />
         <meta name="og:description" property="og:title" content={description} />
       </HashiHead>
-      {ALERT_BANNER_ACTIVE && <AlertBanner {...alertBannerData} theme="blue" />}
+      {ALERT_BANNER_ACTIVE && (
+        <AlertBanner {...alertBannerData} product="waypoint" />
+      )}
       <HashiStackMenu />
       <ProductSubnav />
       <div className="content">

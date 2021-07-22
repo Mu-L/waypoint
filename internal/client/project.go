@@ -25,8 +25,10 @@ type Project struct {
 	workspace           *pb.Ref_Workspace
 	runner              *pb.Ref_Runner
 	labels              map[string]string
+	variables           []*pb.Variable
 	dataSourceOverrides map[string]string
 	cleanupFunc         func()
+	serverVersion       *pb.VersionInfo
 
 	local bool
 
@@ -97,7 +99,7 @@ func New(ctx context.Context, opts ...Option) (*Project, error) {
 		client.activeRunner = r
 
 		// We spin up the job processing here. Anything that spawns jobs (either locally spawned
-		// or server spawned) will be processed by this runner ONLY if the runner is directly targetted.
+		// or server spawned) will be processed by this runner ONLY if the runner is directly targeted.
 		// Because this runner's lifetime is bound to a CLI context and therefore transient, we don't
 		// want to accept jobs that aren't related to local activities (job's queued or RPCs made)
 		// because they'll hang the CLI randomly as those jobs run (it's also a security issue).
@@ -112,7 +114,7 @@ func New(ctx context.Context, opts ...Option) (*Project, error) {
 }
 
 // LocalRunnerId returns the id of the runner that this project started
-// This is used to target jobs specificly at this runner.
+// This is used to target jobs specifically at this runner.
 func (c *Project) LocalRunnerId() (string, bool) {
 	if c.activeRunner == nil {
 		return "", false
@@ -139,6 +141,11 @@ func (c *Project) WorkspaceRef() *pb.Ref_Workspace {
 // Local is true if the server is an in-process just-in-time server.
 func (c *Project) Local() bool {
 	return c.localServer
+}
+
+// ServerVersion returns the server version that this client is connected to.
+func (c *Project) ServerVersion() *pb.VersionInfo {
+	return c.serverVersion
 }
 
 // Close should be called to clean up any resources that the client created.
@@ -217,6 +224,14 @@ func WithClient(client pb.WaypointClient) Option {
 func WithClientConnect(opts ...serverclient.ConnectOption) Option {
 	return func(c *Project, cfg *config) error {
 		cfg.connectOpts = opts
+		return nil
+	}
+}
+
+// WithVariables sets variable values from flags and local env on any operations.
+func WithVariables(m []*pb.Variable) Option {
+	return func(c *Project, cfg *config) error {
+		c.variables = m
 		return nil
 	}
 }

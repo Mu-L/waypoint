@@ -70,6 +70,18 @@ func (c *DeploymentCreateCommand) Run(args []string) int {
 			hostname = hostnamesResp.Hostnames[0]
 		}
 
+		// Status Report
+		app.UI.Output("")
+		_, err = app.StatusReport(ctx, &pb.Job_StatusReportOp{
+			Target: &pb.Job_StatusReportOp_Deployment{
+				Deployment: deployment,
+			},
+		})
+		if err != nil {
+			app.UI.Output(clierrors.Humanize(err), terminal.WithErrorStyle())
+			return ErrSentinel
+		}
+
 		// Release if we're releasing
 		var releaseUrl string
 		if c.flagRelease {
@@ -85,21 +97,48 @@ func (c *DeploymentCreateCommand) Run(args []string) int {
 			}
 
 			releaseUrl = releaseResult.Release.Url
+
+			// NOTE(briancain): Because executeReleaseOp returns an initialized struct
+			// of release results, we need this deep check here to really ensure that a
+			// release actually happened, otherwise we'd attempt to run a status report
+			// on a nil release
+			if releaseResult != nil && releaseResult.Release != nil &&
+				releaseResult.Release.Release != nil {
+				// Status Report
+				app.UI.Output("")
+				_, err = app.StatusReport(ctx, &pb.Job_StatusReportOp{
+					Target: &pb.Job_StatusReportOp_Release{
+						Release: releaseResult.Release,
+					},
+				})
+				if err != nil {
+					app.UI.Output(clierrors.Humanize(err), terminal.WithErrorStyle())
+					return ErrSentinel
+				}
+			}
 		}
+
+		// inplace is true if this was an in-place deploy. We detect this
+		// if we have a generation that uses a non-matching sequence number
+		inplace := result.Deployment.Generation != nil &&
+			result.Deployment.Generation.Id != "" &&
+			result.Deployment.Generation.InitialSequence != result.Deployment.Sequence
 
 		// Output
 		app.UI.Output("")
 		switch {
 		case releaseUrl != "":
-			app.UI.Output(strings.TrimSpace(deployURLService)+"\n", terminal.WithSuccessStyle())
+			printInplaceInfo(inplace, app)
 			app.UI.Output("   Release URL: %s", releaseUrl, terminal.WithSuccessStyle())
 			app.UI.Output("Deployment URL: https://%s", deployUrl, terminal.WithSuccessStyle())
 
 		case hostname != nil:
-			app.UI.Output(strings.TrimSpace(deployURLService)+"\n", terminal.WithSuccessStyle())
+			printInplaceInfo(inplace, app)
 			app.UI.Output("           URL: https://%s", hostname.Fqdn, terminal.WithSuccessStyle())
 			app.UI.Output("Deployment URL: https://%s", deployUrl, terminal.WithSuccessStyle())
-
+		case deployUrl != "":
+			printInplaceInfo(inplace, app)
+			app.UI.Output("Deployment URL: https://%s", deployUrl, terminal.WithSuccessStyle())
 		default:
 			app.UI.Output(strings.TrimSpace(deployNoURL)+"\n", terminal.WithSuccessStyle())
 		}
@@ -113,13 +152,21 @@ func (c *DeploymentCreateCommand) Run(args []string) int {
 	return 0
 }
 
+func printInplaceInfo(inplace bool, app *clientpkg.App) {
+	if !inplace {
+		app.UI.Output(strings.TrimSpace(deployURLService)+"\n", terminal.WithSuccessStyle())
+	} else {
+		app.UI.Output(strings.TrimSpace(deployInPlace)+"\n", terminal.WithSuccessStyle())
+	}
+}
+
 func (c *DeploymentCreateCommand) Flags() *flag.Sets {
 	return c.flagSet(flagSetOperation, func(set *flag.Sets) {
 		f := set.NewSet("Command Options")
 		f.BoolVar(&flag.BoolVar{
 			Name:    "release",
 			Target:  &c.flagRelease,
-			Usage:   "Release this deployment immedately.",
+			Usage:   "Release this deployment immediately.",
 			Default: true,
 		})
 	})
@@ -163,5 +210,10 @@ The release did not provide a URL and the URL service is disabled on the
 server, so no further URL information can be automatically provided. If
 this is unexpected, please ensure the Waypoint server has both the URL service
 enabled and advertise addresses set.
+`
+
+	deployInPlace = `
+The deploy was successful! This deploy was done in-place so the deployment
+URL may match a previous deployment.
 `
 )

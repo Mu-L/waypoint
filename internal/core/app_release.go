@@ -12,6 +12,7 @@ import (
 
 	"github.com/hashicorp/waypoint-plugin-sdk/component"
 	"github.com/hashicorp/waypoint/internal/config"
+	"github.com/hashicorp/waypoint/internal/plugin"
 	pb "github.com/hashicorp/waypoint/internal/server/gen"
 )
 
@@ -57,10 +58,12 @@ func (a *App) Release(ctx context.Context, target *pb.Deployment) (
 			"err", err)
 	}
 
+	unimplemeneted := false
 	c, err := a.createReleaser(ctx, &evalCtx)
 	if status.Code(err) == codes.Unimplemented {
 		c = nil
 		err = nil
+		unimplemeneted = true
 	}
 	if err != nil {
 		return nil, nil, err
@@ -73,6 +76,12 @@ func (a *App) Release(ctx context.Context, target *pb.Deployment) (
 	})
 	if err != nil {
 		return nil, nil, err
+	}
+
+	if releasepb != nil {
+		rpb := releasepb.(*pb.Release)
+		rpb.Unimplemented = unimplemeneted
+		releasepb = rpb
 	}
 
 	var release component.Release
@@ -103,7 +112,13 @@ func (a *App) createReleaser(ctx context.Context, hclCtx *hcl.EvalContext) (*Com
 	}
 
 	// No releaser. Let's try a default releaser if we can. We first
-	// initialize the platform.
+	// initialize the platform. We need to configure the eval context to
+	// match a deployment.
+	hclCtx = hclCtx.NewChild()
+	if _, err := a.deployEvalContext(ctx, hclCtx); err != nil {
+		return nil, err
+	}
+
 	log.Debug("no release manager plugin, initializing platform to check for default releaser")
 	platformC, err := componentCreatorMap[component.PlatformType].Create(ctx, a, hclCtx)
 	if err != nil {
@@ -115,7 +130,7 @@ func (a *App) createReleaser(ctx context.Context, hclCtx *hcl.EvalContext) (*Com
 	if !ok || pr.DefaultReleaserFunc() == nil {
 		log.Debug("default releaser not supported by platform, stopping")
 		platformC.Close()
-		return nil, status.Errorf(codes.Unimplemented, "")
+		return nil, status.Errorf(codes.Unimplemented, "no releaser is supported by the requested platform")
 	}
 
 	// It does! Initialize it.
@@ -213,7 +228,7 @@ func (op *releaseOperation) Do(ctx context.Context, log hclog.Logger, app *App, 
 		(*component.Release)(nil),
 		op.Component,
 		op.Component.Value.(component.ReleaseManager).ReleaseFunc(),
-		argNamedAny("target", op.Target.Deployment),
+		plugin.ArgNamedAny("target", op.Target.Deployment),
 	)
 	if err != nil {
 		return nil, err

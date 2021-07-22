@@ -4,9 +4,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/boltdb/bolt"
 	"github.com/golang/protobuf/proto"
 	"github.com/hashicorp/go-memdb"
+	bolt "go.etcd.io/bbolt"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -359,7 +359,10 @@ func (s *State) projectIndexSet(txn *memdb.Txn, id []byte, value *pb.Project) er
 	// up to downstream users to call ProjectNextPoll repeatedly to iterate
 	// over the next projects to poll and do something.
 	if p := value.DataSourcePoll; p != nil && p.Enabled {
-		// This should be validated downstream so this should never fail.
+		// If it's empty at this point, we'll set the default here.
+		if p.Interval == "" {
+			p.Interval = defaultPollInterval
+		}
 		interval, err := time.ParseDuration(p.Interval)
 		if err != nil {
 			return err
@@ -465,6 +468,8 @@ const (
 	projectIndexNextPollIndexName = "next-poll"
 
 	projectWaypointHclMaxSize = 5 * 1024 // 5 MB
+
+	defaultPollInterval = "30s"
 )
 
 type projectIndexRecord struct {

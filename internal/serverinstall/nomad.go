@@ -21,6 +21,7 @@ type NomadInstaller struct {
 }
 
 type nomadConfig struct {
+	authSoftFail       bool              `hcl:"auth_soft_fail,optional"`
 	serverImage        string            `hcl:"server_image,optional"`
 	namespace          string            `hcl:"namespace,optional"`
 	serviceAnnotations map[string]string `hcl:"service_annotations,optional"`
@@ -29,8 +30,18 @@ type nomadConfig struct {
 	datacenters    []string `hcl:"datacenters,optional"`
 	policyOverride bool     `hcl:"policy_override,optional"`
 
-	serverPurge bool `hcl:"serverPurge,optional"`
+	serverResourcesCPU    string `hcl:"server_resources_cpu,optional"`
+	serverResourcesMemory string `hcl:"server_resources_memory,optional"`
+	runnerResourcesCPU    string `hcl:"runner_resources_cpu,optional"`
+	runnerResourcesMemory string `hcl:"runner_resources_memory,optional"`
 }
+
+var (
+	// default resources used for both the Server and its runners. Can be overridden
+	// through config flags at install
+	defaultResourcesCPU    = 200
+	defaultResourcesMemory = 600
+)
 
 // Install is a method of NomadInstaller and implements the Installer interface to
 // register a waypoint-server job with a Nomad cluster
@@ -334,7 +345,7 @@ EVAL:
 }
 
 // Unnstall is a method of NomadInstaller and implements the Installer interface to
-// stop, and optionally purge, the waypoint-server job on a Nomad cluster
+// stop and purge the waypoint-server job on a Nomad cluster
 func (i *NomadInstaller) Uninstall(ctx context.Context, opts *InstallOpts) error {
 	ui := opts.UI
 
@@ -370,7 +381,7 @@ func (i *NomadInstaller) Uninstall(ctx context.Context, opts *InstallOpts) error
 
 	s.Update("Removing Waypoint server from Nomad...")
 
-	_, _, err = client.Jobs().Deregister(serverName, i.config.serverPurge, &api.WriteOptions{})
+	_, _, err = client.Jobs().Deregister(serverName, true, &api.WriteOptions{})
 	if err != nil {
 		ui.Output(
 			"Error deregistering waypoint server job: %s", clierrors.Humanize(err),
@@ -395,11 +406,7 @@ func (i *NomadInstaller) Uninstall(ctx context.Context, opts *InstallOpts) error
 		}
 	}
 
-	if i.config.serverPurge {
-		s.Update("Waypoint job and allocations purged")
-	} else {
-		s.Update("Waypoint job and allocations stopped")
-	}
+	s.Update("Waypoint job and allocations purged")
 	s.Done()
 
 	return nil
@@ -474,7 +481,7 @@ func (i *NomadInstaller) UninstallRunner(
 	}
 
 	s.Update("Removing Waypoint runner...")
-	_, _, err = client.Jobs().Deregister(runnerName, i.config.serverPurge, &api.WriteOptions{})
+	_, _, err = client.Jobs().Deregister(runnerName, true, &api.WriteOptions{})
 	if err != nil {
 		ui.Output(
 			"Error deregistering Waypoint runner job: %s", clierrors.Humanize(err),
@@ -500,11 +507,7 @@ func (i *NomadInstaller) UninstallRunner(
 		}
 	}
 
-	if i.config.serverPurge {
-		s.Update("Waypoint runner job and allocations purged")
-	} else {
-		s.Update("Waypoint runner job and allocations stopped")
-	}
+	s.Update("Waypoint runner job and allocations purged")
 	s.Done()
 
 	return nil
@@ -648,12 +651,28 @@ func waypointNomadJob(c nomadConfig) *api.Job {
 
 	task := api.NewTask("server", "docker")
 	task.Config = map[string]interface{}{
-		"image": c.serverImage,
-		"ports": []string{"server", "ui"},
-		"args":  []string{"server", "run", "-accept-tos", "-vvv", "-db=/alloc/data/data.db", fmt.Sprintf("-listen-grpc=0.0.0.0:%s", defaultGrpcPort), fmt.Sprintf("-listen-http=0.0.0.0:%s", defaultHttpPort)},
+		"image":          c.serverImage,
+		"ports":          []string{"server", "ui"},
+		"args":           []string{"server", "run", "-accept-tos", "-vvv", "-db=/alloc/data/data.db", fmt.Sprintf("-listen-grpc=0.0.0.0:%s", defaultGrpcPort), fmt.Sprintf("-listen-http=0.0.0.0:%s", defaultHttpPort)},
+		"auth_soft_fail": c.authSoftFail,
 	}
 	task.Env = map[string]string{
 		"PORT": defaultGrpcPort,
+	}
+
+	cpu := defaultResourcesCPU
+	mem := defaultResourcesMemory
+
+	if c.serverResourcesCPU != "" {
+		cpu, _ = strconv.Atoi(c.serverResourcesCPU)
+	}
+
+	if c.serverResourcesMemory != "" {
+		mem, _ = strconv.Atoi(c.serverResourcesMemory)
+	}
+	task.Resources = &api.Resources{
+		CPU:      &cpu,
+		MemoryMB: &mem,
 	}
 	tg.AddTask(task)
 
@@ -684,6 +703,22 @@ func waypointRunnerNomadJob(c nomadConfig, opts *InstallRunnerOpts) *api.Job {
 			"agent",
 			"-vvv",
 		},
+		"auth_soft_fail": c.authSoftFail,
+	}
+
+	cpu := defaultResourcesCPU
+	mem := defaultResourcesMemory
+
+	if c.runnerResourcesCPU != "" {
+		cpu, _ = strconv.Atoi(c.runnerResourcesCPU)
+	}
+
+	if c.runnerResourcesMemory != "" {
+		mem, _ = strconv.Atoi(c.runnerResourcesMemory)
+	}
+	task.Resources = &api.Resources{
+		CPU:      &cpu,
+		MemoryMB: &mem,
 	}
 
 	task.Env = map[string]string{}
@@ -744,6 +779,14 @@ func (i *NomadInstaller) InstallFlags(set *flag.Set) {
 		Usage:  "Annotations for the Service generated.",
 	})
 
+	set.BoolVar(&flag.BoolVar{
+		Name:    "nomad-auth-soft-fail",
+		Target:  &i.config.authSoftFail,
+		Default: false,
+		Usage: "Don't fail the Nomad task on an auth failure obtaining server " +
+			"image container. Attempt to continue without auth.",
+	})
+
 	set.StringSliceVar(&flag.StringSliceVar{
 		Name:    "nomad-dc",
 		Target:  &i.config.datacenters,
@@ -770,6 +813,34 @@ func (i *NomadInstaller) InstallFlags(set *flag.Set) {
 		Target:  &i.config.region,
 		Default: "global",
 		Usage:   "Region to install to for Nomad.",
+	})
+
+	set.StringVar(&flag.StringVar{
+		Name:    "nomad-server-cpu",
+		Target:  &i.config.serverResourcesCPU,
+		Usage:   "CPU required to run this task in MHz.",
+		Default: strconv.Itoa(defaultResourcesCPU),
+	})
+
+	set.StringVar(&flag.StringVar{
+		Name:    "nomad-server-memory",
+		Target:  &i.config.serverResourcesMemory,
+		Usage:   "MB of Memory to allocate to the Server job task.",
+		Default: strconv.Itoa(defaultResourcesMemory),
+	})
+
+	set.StringVar(&flag.StringVar{
+		Name:    "nomad-runner-cpu",
+		Target:  &i.config.runnerResourcesCPU,
+		Usage:   "CPU required to run this task in MHz.",
+		Default: strconv.Itoa(defaultResourcesCPU),
+	})
+
+	set.StringVar(&flag.StringVar{
+		Name:    "nomad-runner-memory",
+		Target:  &i.config.runnerResourcesMemory,
+		Usage:   "MB of Memory to allocate to the runner job task.",
+		Default: strconv.Itoa(defaultResourcesMemory),
 	})
 
 	set.StringVar(&flag.StringVar{
@@ -787,6 +858,14 @@ func (i *NomadInstaller) UpgradeFlags(set *flag.Set) {
 		Usage:  "Annotations for the Service generated.",
 	})
 
+	set.BoolVar(&flag.BoolVar{
+		Name:    "nomad-auth-soft-fail",
+		Target:  &i.config.authSoftFail,
+		Default: false,
+		Usage: "Don't fail the Nomad task on an auth failure obtaining server " +
+			"image container. Attempt to continue without auth.",
+	})
+
 	set.StringSliceVar(&flag.StringSliceVar{
 		Name:    "nomad-dc",
 		Target:  &i.config.datacenters,
@@ -816,6 +895,34 @@ func (i *NomadInstaller) UpgradeFlags(set *flag.Set) {
 	})
 
 	set.StringVar(&flag.StringVar{
+		Name:    "nomad-server-cpu",
+		Target:  &i.config.serverResourcesCPU,
+		Usage:   "CPU required to run this task in MHz.",
+		Default: strconv.Itoa(defaultResourcesCPU),
+	})
+
+	set.StringVar(&flag.StringVar{
+		Name:    "nomad-server-memory",
+		Target:  &i.config.serverResourcesMemory,
+		Usage:   "MB of Memory to allocate to the server job task.",
+		Default: strconv.Itoa(defaultResourcesMemory),
+	})
+
+	set.StringVar(&flag.StringVar{
+		Name:    "nomad-runner-cpu",
+		Target:  &i.config.runnerResourcesCPU,
+		Usage:   "CPU required to run this task in MHz.",
+		Default: strconv.Itoa(defaultResourcesCPU),
+	})
+
+	set.StringVar(&flag.StringVar{
+		Name:    "nomad-runner-memory",
+		Target:  &i.config.runnerResourcesMemory,
+		Usage:   "MB of Memory to allocate to the runner job task.",
+		Default: strconv.Itoa(defaultResourcesMemory),
+	})
+
+	set.StringVar(&flag.StringVar{
 		Name:    "nomad-server-image",
 		Target:  &i.config.serverImage,
 		Usage:   "Docker image for the Waypoint server.",
@@ -824,9 +931,5 @@ func (i *NomadInstaller) UpgradeFlags(set *flag.Set) {
 }
 
 func (i *NomadInstaller) UninstallFlags(set *flag.Set) {
-	set.BoolVar(&flag.BoolVar{
-		Name:   "nomad-purge",
-		Target: &i.config.serverPurge,
-		Usage:  "Purge the Waypoint server job after deregistering as part of uninstall.",
-	})
+	// Purposely empty, no flags
 }

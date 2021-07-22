@@ -27,6 +27,7 @@ type DeploymentListCommand struct {
 
 	flagWorkspaceAll bool
 	flagVerbose      bool
+	flagUrl          bool
 	flagJson         bool
 	flagId           idFormat
 	filterFlags      filterFlags
@@ -108,11 +109,34 @@ func (c *DeploymentListCommand) Run(args []string) int {
 		}
 		sort.Sort(serversort.DeploymentCompleteDesc(resp.Deployments))
 
+		// get status reports
+		statusReportsResp, err := client.ListStatusReports(ctx, &pb.ListStatusReportsRequest{
+			Application: app.Ref(),
+			Workspace:   wsRef,
+		})
+
+		if status.Code(err) == codes.NotFound || status.Code(err) == codes.Unimplemented {
+			err = nil
+			statusReportsResp = nil
+		}
+		if err != nil {
+			app.UI.Output(clierrors.Humanize(err), terminal.WithErrorStyle())
+			return ErrSentinel
+		}
+
 		if c.flagJson {
 			return c.displayJson(resp.Deployments)
 		}
 
-		tbl := terminal.NewTable("", "ID", "Platform", "Details", "Started", "Completed")
+		headers := []string{
+			"", "ID", "Platform", "Details", "Started", "Completed", "Health",
+		}
+
+		if c.flagUrl {
+			headers = append(headers, "URL")
+		}
+
+		tbl := terminal.NewTable(headers...)
 
 		const bullet = "●"
 
@@ -155,6 +179,31 @@ func (c *DeploymentListCommand) Run(args []string) int {
 				completeTime = humanize.Time(t)
 			}
 
+			// Add status report information if we have any
+			statusReportComplete := "n/a"
+			for _, statusReport := range statusReportsResp.StatusReports {
+				if deploymentTargetId, ok := statusReport.TargetId.(*pb.StatusReport_DeploymentId); ok {
+					if deploymentTargetId.DeploymentId == b.Id {
+						switch statusReport.Health.HealthStatus {
+						case "READY":
+							statusReportComplete = "✔"
+						case "ALIVE":
+							statusReportComplete = "✔"
+						case "DOWN":
+							statusReportComplete = "✖"
+						case "PARTIAL":
+							statusReportComplete = "●"
+						case "UNKNOWN":
+							statusReportComplete = "?"
+						}
+
+						if t, err := ptypes.Timestamp(statusReport.GeneratedTime); err == nil {
+							statusReportComplete = fmt.Sprintf("%s - %s", statusReportComplete, humanize.Time(t))
+						}
+					}
+				}
+			}
+
 			var (
 				extraDetails []string
 				details      []string
@@ -176,12 +225,12 @@ func (c *DeploymentListCommand) Run(args []string) int {
 				details = append(details, "image:"+img)
 			}
 
-			artdetails := fmt.Sprintf("artifact:%s", c.flagId.FormatId(b.Preload.Artifact.Sequence, b.Preload.Artifact.Id))
+			artDetails := fmt.Sprintf("artifact:%s", c.flagId.FormatId(b.Preload.Artifact.Sequence, b.Preload.Artifact.Id))
 			if len(details) == 0 {
-				details = append(details, artdetails)
+				details = append(details, artDetails)
 			} else if c.flagVerbose {
 				details = append(details,
-					artdetails,
+					artDetails,
 					fmt.Sprintf("build:%s", c.flagId.FormatId(b.Preload.Build.Sequence, b.Preload.Build.Id)))
 			}
 
@@ -227,15 +276,30 @@ func (c *DeploymentListCommand) Run(args []string) int {
 
 			sort.Strings(details)
 
+			var columns []string
+
+			columns = []string{
+				status,
+				c.flagId.FormatId(b.Sequence, b.Id),
+				b.Component.Name,
+				details[0],
+				startTime,
+				completeTime,
+				statusReportComplete,
+			}
+
+			if c.flagUrl {
+				url := "n/a"
+				if b.Url != "" {
+					url = b.Url
+				} else if b.Preload.DeployUrl != "" {
+					url = b.Preload.DeployUrl
+				}
+				columns = append(columns, url)
+			}
+
 			tbl.Rich(
-				[]string{
-					status,
-					c.flagId.FormatId(b.Sequence, b.Id),
-					b.Component.Name,
-					details[0],
-					startTime,
-					completeTime,
-				},
+				columns,
 				[]string{
 					statusColor,
 				},
@@ -341,6 +405,13 @@ func (c *DeploymentListCommand) Flags() *flag.Sets {
 			Aliases: []string{"V"},
 			Target:  &c.flagVerbose,
 			Usage:   "Display more details about each deployment.",
+		})
+
+		f.BoolVar(&flag.BoolVar{
+			Name:    "url",
+			Aliases: []string{"u"},
+			Target:  &c.flagUrl,
+			Usage:   "Display deployment URL.",
 		})
 
 		f.BoolVar(&flag.BoolVar{

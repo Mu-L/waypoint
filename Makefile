@@ -8,11 +8,26 @@ GOLDFLAGS="-s -w -X $(GIT_IMPORT).GitCommit=$(GIT_COMMIT)$(GIT_DIRTY) -X $(GIT_I
 CGO_ENABLED?=0
 GO_CMD?=go
 
+# For changelog generation, default the last release to the last tag on
+# any branch, and this release to just be the current branch we're on.
+LAST_RELEASE?=$$(git describe --tags $$(git rev-list --tags --max-count=1))
+THIS_RELEASE?=$$(git rev-parse --abbrev-ref HEAD)
+
 .PHONY: bin
 bin: # bin creates the binaries for Waypoint for the current platform
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ./internal/assets/ceb/ceb ./cmd/waypoint-entrypoint
 	cd internal/assets && go-bindata -pkg assets -o prod.go -tags assetsembedded ./ceb
 	CGO_ENABLED=$(CGO_ENABLED) go build -ldflags $(GOLDFLAGS) -tags assetsembedded -o ./waypoint ./cmd/waypoint
+
+.PHONY: bin/cli-only
+bin/cli-only: # bin/cli-only only recompiles waypoint
+	CGO_ENABLED=$(CGO_ENABLED) go build -ldflags $(GOLDFLAGS) -tags assetsembedded -o ./waypoint ./cmd/waypoint
+
+.PHONY: bin/linux
+bin/linux: # bin creates the binaries for Waypoint for the linux platform
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ./internal/assets/ceb/ceb ./cmd/waypoint-entrypoint
+	cd internal/assets && go-bindata -pkg assets -o prod.go -tags assetsembedded ./ceb
+	GOOS=linux CGO_ENABLED=$(CGO_ENABLED) go build -ldflags $(GOLDFLAGS) -tags assetsembedded -o ./waypoint ./cmd/waypoint
 
 .PHONY: bin/windows
 bin/windows: # create windows binaries
@@ -39,9 +54,6 @@ format: # format go code
 .PHONY: docker/server
 docker/server:
 	DOCKER_BUILDKIT=1 docker build \
-					--ssh default \
-					--secret id=ssh.config,src="${HOME}/.ssh/config" \
-					--secret id=ssh.key,src="${HOME}/.ssh/config" \
 					-t waypoint:dev \
 					.
 
@@ -52,11 +64,33 @@ docker/evanphx:
 					-t waypoint:latest \
 					.
 
+# expected to be invoked by make gen/changelog LAST_RELEASE=gitref THIS_RELEASE=gitref
+.PHONY: gen/changelog
+gen/changelog:
+	@echo "Generating changelog for $(THIS_RELEASE) from $(LAST_RELEASE)..."
+	@echo
+	@changelog-build -last-release $(LAST_RELEASE) \
+		-entries-dir .changelog/ \
+		-changelog-template .changelog/changelog.tmpl \
+		-note-template .changelog/note.tmpl \
+		-this-release $(THIS_RELEASE)
+
+# generates protos for the plugins inside builtin
+.PHONY: gen/plugins
+gen/plugins:
+	@test -s "thirdparty/proto/api-common-protos/.git" || { echo "git submodules not initialized, run 'git submodule update --init --recursive' and try again"; exit 1; }
+	go generate ./builtin/...
+
+.PHONY: gen/server
+gen/server:
+	@test -s "thirdparty/proto/api-common-protos/.git" || { echo "git submodules not initialized, run 'git submodule update --init --recursive' and try again"; exit 1; }
+	go generate ./internal/server
+
 .PHONY: gen/ts
 gen/ts:
 	@rm -rf ./ui/lib/api-common-protos/google 2> /dev/null
 	protoc -I=. \
-		-I=./vendor/proto/api-common-protos/ \
+		-I=./thirdparty/proto/api-common-protos/ \
 		./internal/server/proto/server.proto \
 		--js_out=import_style=commonjs:ui/lib/waypoint-pb/ \
 		--grpc-web_out=import_style=typescript,mode=grpcwebtext:ui/lib/waypoint-client/
@@ -73,8 +107,8 @@ gen/ts:
 	find . -type f -wholename './ui/lib/waypoint-client/*' | xargs sed -i 's/..\/..\/..\/internal\/server\/protwaypoint-pb/waypoint-pb/g'
 
 	protoc \
-		-I=./vendor/proto/api-common-protos/ \
-		./vendor/proto/api-common-protos/google/**/*.proto \
+		-I=./thirdparty/proto/api-common-protos/ \
+		./thirdparty/proto/api-common-protos/google/**/*.proto \
 		--js_out=import_style=commonjs,binary:ui/lib/api-common-protos/ \
 		--ts_out=ui/lib/api-common-protos/
 	@rm -rf ./ui/lib/waypoint-pb/internal
@@ -89,11 +123,18 @@ static-assets:
 
 .PHONY: gen/doc
 gen/doc:
+	mkdir -p ./doc/
 	@rm -rf ./doc/* 2> /dev/null
 	protoc -I=. \
-		-I=./vendor/proto/api-common-protos/ \
+		-I=./thirdparty/proto/api-common-protos/ \
 		--doc_out=./doc --doc_opt=html,index.html \
 		./internal/server/proto/server.proto
+
+.PHONY: gen/website-mdx
+gen/website-mdx:
+	go run ./cmd/waypoint docs -website-mdx
+	go run ./tools/gendocs
+	cd ./website; npx --no-install next-hashicorp format
 
 .PHONY: tools
 tools: # install dependencies and tools required to build

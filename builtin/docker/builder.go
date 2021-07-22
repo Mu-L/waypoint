@@ -49,6 +49,12 @@ type BuilderConfig struct {
 
 	// The name/path to the Dockerfile if it is not the root of the project
 	Dockerfile string `hcl:"dockerfile,optional"`
+
+	// Controls the passing of build time variables
+	BuildArgs map[string]*string `hcl:"build_args,optional"`
+
+	// Controls the passing of build context
+	Context string `hcl:"context,optional"`
 }
 
 func (b *Builder) Documentation() (*docs.Documentation, error) {
@@ -118,6 +124,20 @@ build {
 		),
 	)
 
+	doc.SetField(
+		"build_args",
+		"build args to pass to docker or img for the build step",
+		docs.Summary(
+			"An array of strings of build-time variables passed as build-arg to docker",
+			" or img for the build step.",
+		),
+	)
+
+	doc.SetField(
+		"context",
+		"Build context path",
+	)
+
 	return doc, nil
 }
 
@@ -180,10 +200,20 @@ func (b *Builder) Build(
 		dockerfile = newPath
 	}
 
-	contextDir, relDockerfile, err := build.GetContextFromLocalDir(src.Path, dockerfile)
+	path := src.Path
+
+	if b.config.Context != "" {
+		path = b.config.Context
+	}
+
+	contextDir, relDockerfile, err := build.GetContextFromLocalDir(path, dockerfile)
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "unable to create Docker context: %s", err)
 	}
+	log.Debug("loaded Docker context",
+		"context_dir", contextDir,
+		"dockerfile", relDockerfile,
+	)
 
 	// We now test if Docker is actually functional. We do this here because we
 	// need all of the above to complete the actual build.
@@ -202,6 +232,7 @@ func (b *Builder) Build(
 		step = nil
 		if err := b.buildWithImg(
 			ctx, ui, sg, relDockerfile, contextDir, result.Name(),
+			b.config.BuildArgs,
 		); err != nil {
 			return nil, err
 		}
@@ -217,7 +248,7 @@ func (b *Builder) Build(
 		step.Done()
 		step = nil
 		if err := b.buildWithDocker(
-			ctx, ui, sg, cli, contextDir, relDockerfile, result.Name(),
+			ctx, ui, sg, cli, contextDir, relDockerfile, result.Name(), b.config.BuildArgs,
 		); err != nil {
 			return nil, err
 		}
@@ -273,6 +304,7 @@ func (b *Builder) buildWithDocker(
 	contextDir string,
 	relDockerfile string,
 	tag string,
+	buildArgs map[string]*string,
 ) error {
 	excludes, err := build.ReadDockerignore(contextDir)
 	if err != nil {
@@ -314,6 +346,7 @@ func (b *Builder) buildWithDocker(
 		Dockerfile: relDockerfile,
 		Tags:       []string{tag},
 		Remove:     true,
+		BuildArgs:  buildArgs,
 	})
 	if err != nil {
 		return status.Errorf(codes.Internal, "error building image: %s", err)

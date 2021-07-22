@@ -2,12 +2,11 @@ package docker
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-
-	"fmt"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -17,6 +16,7 @@ import (
 	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/go-connections/nat"
 	goUnits "github.com/docker/go-units"
+	"github.com/golang/protobuf/ptypes"
 	"github.com/hashicorp/go-hclog"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -24,8 +24,11 @@ import (
 
 	"github.com/hashicorp/waypoint-plugin-sdk/component"
 	"github.com/hashicorp/waypoint-plugin-sdk/docs"
+	"github.com/hashicorp/waypoint-plugin-sdk/framework/resource"
 	"github.com/hashicorp/waypoint-plugin-sdk/terminal"
 	wpdockerclient "github.com/hashicorp/waypoint/builtin/docker/client"
+
+	sdk "github.com/hashicorp/waypoint-plugin-sdk/proto/gen"
 )
 
 const (
@@ -71,6 +74,391 @@ func (p *Platform) ValidateAuth() error {
 	return nil
 }
 
+// StatusFunc implements component.Status
+func (p *Platform) StatusFunc() interface{} {
+	return p.Status
+}
+
+func (p *Platform) resourceManager(log hclog.Logger) *resource.Manager {
+	return resource.NewManager(
+		resource.WithLogger(log.Named("resource_manager")),
+		resource.WithValueProvider(p.getDockerClient),
+		resource.WithResource(resource.NewResource(
+			resource.WithName("network"),
+			resource.WithState(&Resource_Network{}),
+			resource.WithCreate(p.resourceNetworkCreate),
+
+			// networks have no destroy logic, we leave the network
+			// lingering around for now. This was the logic prior to
+			// refactoring into the resource manager so we kept it.
+		)),
+
+		resource.WithResource(resource.NewResource(
+			resource.WithName("container"),
+			resource.WithState(&Resource_Container{}),
+			resource.WithCreate(p.resourceContainerCreate),
+			resource.WithDestroy(p.resourceContainerDestroy),
+		)),
+	)
+	return nil
+}
+
+func (p *Platform) Status(
+	ctx context.Context,
+	log hclog.Logger,
+	deployment *Deployment,
+	ui terminal.UI,
+) (*sdk.StatusReport, error) {
+	cli, err := p.getDockerClient(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "unable to create Docker client: %s", err)
+	}
+	cli.NegotiateAPIVersion(ctx)
+
+	sg := ui.StepGroup()
+	defer sg.Wait()
+
+	s := sg.Add("Gathering health report for Docker platform...")
+	defer s.Abort()
+
+	// currently the docker platform only deploys 1 container
+	containerInfo, err := cli.ContainerInspect(ctx, deployment.Container)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create our status report
+	var result sdk.StatusReport
+	result.External = true
+
+	// NOTE(briancain): The docker platform currently only deploys a single
+	// container, so for now the status report makes the same assumption.
+
+	log.Debug("querying docker for container health")
+
+	resources := []*sdk.StatusReport_Resource{{
+		Name: containerInfo.Name,
+	}}
+
+	if containerInfo.State.Health != nil {
+		// Built-in Docker health reporting
+		// NOTE: this only works if the container has configured health checks
+
+		switch containerInfo.State.Health.Status {
+		case "Healthy":
+			resources[0].Health = sdk.StatusReport_READY
+			resources[0].HealthMessage = "container is running"
+		case "Unhealthy":
+			resources[0].Health = sdk.StatusReport_DOWN
+			resources[0].HealthMessage = "container is down"
+		case "Starting":
+			resources[0].Health = sdk.StatusReport_ALIVE
+			resources[0].HealthMessage = "container is starting"
+		default:
+			resources[0].Health = sdk.StatusReport_UNKNOWN
+			resources[0].HealthMessage = "unknown status reported by docker for container"
+		}
+	} else {
+		// Waypoint container inspection
+
+		if containerInfo.State.Running && containerInfo.State.ExitCode == 0 {
+			resources[0].Health = sdk.StatusReport_READY
+			resources[0].HealthMessage = "container is running"
+		} else if containerInfo.State.Restarting || containerInfo.State.Status == "created" {
+			resources[0].Health = sdk.StatusReport_ALIVE
+			resources[0].HealthMessage = "container is still starting"
+		} else if containerInfo.State.Dead || containerInfo.State.OOMKilled || containerInfo.State.ExitCode != 0 {
+			resources[0].Health = sdk.StatusReport_DOWN
+			resources[0].HealthMessage = "container is down"
+		} else {
+			resources[0].Health = sdk.StatusReport_UNKNOWN
+			resources[0].HealthMessage = "unknown status for container"
+		}
+	}
+
+	result.Resources = resources
+
+	// Determine overall deployment health based on its resource health
+	var ready, alive, down, unknown int
+	for _, r := range result.Resources {
+		switch r.Health {
+		case sdk.StatusReport_DOWN:
+			down++
+		case sdk.StatusReport_UNKNOWN:
+			unknown++
+		case sdk.StatusReport_READY:
+			ready++
+		case sdk.StatusReport_ALIVE:
+			alive++
+		}
+	}
+
+	if ready == len(result.Resources) {
+		result.Health = sdk.StatusReport_READY
+		result.HealthMessage = fmt.Sprintf("Container %q is reporting ready!", containerInfo.Name)
+	} else if down == len(result.Resources) {
+		result.Health = sdk.StatusReport_DOWN
+		result.HealthMessage = fmt.Sprintf("Container %q is reporting down!", containerInfo.Name)
+	} else if unknown == len(result.Resources) {
+		result.Health = sdk.StatusReport_UNKNOWN
+		result.HealthMessage = fmt.Sprintf("Container %q is reporting unknown!", containerInfo.Name)
+	} else if alive == len(result.Resources) {
+		result.Health = sdk.StatusReport_ALIVE
+		result.HealthMessage = fmt.Sprintf("Container %q is reporting alive!", containerInfo.Name)
+	} else {
+		result.Health = sdk.StatusReport_PARTIAL
+		result.HealthMessage = fmt.Sprintf("Container %q is reporting partially available!", containerInfo.Name)
+	}
+
+	result.GeneratedTime = ptypes.TimestampNow()
+	log.Debug("status report complete")
+
+	// update output based on main health state
+	s.Update("Finished building report for Docker platform")
+	s.Done()
+
+	// NOTE(briancain): Replace ui.Status with StepGroups once this bug
+	// has been fixed: https://github.com/hashicorp/waypoint/issues/1536
+	st := ui.Status()
+	defer st.Close()
+
+	st.Update("Determining overall container health...")
+	if result.Health == sdk.StatusReport_READY {
+		st.Step(terminal.StatusOK, result.HealthMessage)
+	} else {
+		if result.Health == sdk.StatusReport_PARTIAL {
+			st.Step(terminal.StatusWarn, result.HealthMessage)
+		} else {
+			st.Step(terminal.StatusError, result.HealthMessage)
+		}
+
+		// Extra advisory wording to let user know that the deployment could be still starting up
+		// if the report was generated immediately after it was deployed or released.
+		st.Step(terminal.StatusWarn, mixedHealthWarn)
+	}
+
+	return &result, nil
+}
+
+func (p *Platform) resourceNetworkCreate(
+	ctx context.Context,
+	cli *client.Client,
+	sg terminal.StepGroup,
+	state *Resource_Network,
+) error {
+	s := sg.Add("Setting up network...")
+	defer func() { s.Abort() }()
+
+	nets, err := cli.NetworkList(ctx, types.NetworkListOptions{
+		Filters: filters.NewArgs(filters.Arg("label", "use=waypoint")),
+	})
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "unable to list Docker networks: %s", err)
+	}
+
+	// If we have a network already we're done. If we don't have a net, create it.
+	if len(nets) == 0 {
+		_, err = cli.NetworkCreate(ctx, "waypoint", types.NetworkCreate{
+			Driver:         "bridge",
+			CheckDuplicate: true,
+			Internal:       false,
+			Attachable:     true,
+			Labels: map[string]string{
+				"use": "waypoint",
+			},
+		})
+		if err != nil {
+			return status.Errorf(codes.FailedPrecondition, "unable to create Docker network: %s", err)
+		}
+	}
+	s.Done()
+
+	// Set our state
+	state.Name = "waypoint"
+
+	return nil
+}
+
+func (p *Platform) resourceContainerCreate(
+	ctx context.Context,
+	log hclog.Logger,
+	cli *client.Client,
+	src *component.Source,
+	img *Image,
+	job *component.JobInfo,
+	deployConfig *component.DeploymentConfig,
+	result *Deployment,
+	sg terminal.StepGroup,
+	ui terminal.UI,
+	state *Resource_Container,
+	netState *Resource_Network,
+) error {
+	// Pull the image
+	err := p.pullImage(cli, log, ui, img, p.config.ForcePull)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition,
+			"unable to pull image from Docker registry: %s", err)
+	}
+
+	s := sg.Add("Creating new container...")
+	defer func() { s.Abort() }()
+
+	portBindings := nat.PortMap{}
+	exposedPorts := nat.PortSet{}
+	for _, port := range append(p.config.ExtraPorts, p.config.ServicePort) {
+		np, err := nat.NewPort("tcp", fmt.Sprint(port))
+		if err != nil {
+			return err
+		}
+
+		exposedPorts[np] = struct{}{}
+		portBindings[np] = []nat.PortBinding{
+			{
+				HostPort: "", // this is intentionally left empty for a random host port assignment
+			},
+		}
+	}
+
+	cfg := container.Config{
+		AttachStdout: true,
+		AttachStderr: true,
+		AttachStdin:  true,
+		OpenStdin:    true,
+		StdinOnce:    true,
+		Image:        img.Image + ":" + img.Tag,
+		ExposedPorts: exposedPorts,
+		Env:          []string{"PORT=" + fmt.Sprint(p.config.ServicePort)},
+	}
+	if c := p.config.Command; len(c) > 0 {
+		cfg.Cmd = c
+	}
+
+	// default container binds
+	containerBinds := []string{src.App + "-scratch" + ":/input"}
+	if p.config.Binds != nil {
+		containerBinds = append(containerBinds, p.config.Binds...)
+	}
+
+	// Setup the resource requirements for the container if given
+	var resources container.Resources
+	if p.config.Resources != nil {
+		memory, err := goUnits.FromHumanSize(p.config.Resources["memory"])
+		if err != nil {
+			return err
+		}
+		resources.Memory = memory
+
+		cpu, err := strconv.ParseInt(p.config.Resources["cpu"], 10, 64)
+		if err != nil {
+			return err
+		}
+		resources.CPUShares = cpu
+	}
+
+	// Build our host configuration from the bindings, ports, and resources.
+	hostconfig := container.HostConfig{
+		Binds:        containerBinds,
+		PortBindings: portBindings,
+		Resources:    resources,
+	}
+
+	// Containers can only be connected to 1 network at creation time
+	// Additional user defined networks will be connected after container is
+	// created.
+	netconfig := network.NetworkingConfig{
+		EndpointsConfig: map[string]*network.EndpointSettings{
+			netState.Name: {},
+		},
+	}
+
+	for k, v := range p.config.StaticEnvVars {
+		cfg.Env = append(cfg.Env, k+"="+v)
+	}
+	for k, v := range deployConfig.Env() {
+		cfg.Env = append(cfg.Env, k+"="+v)
+	}
+
+	// Setup the labels. We setup a set of defaults and then override them
+	// with any user configured labels.
+	defaultLabels := map[string]string{
+		labelId:     result.Id,
+		"app":       src.App,
+		"workspace": job.Workspace,
+	}
+	if p.config.Labels != nil {
+		for k, v := range defaultLabels {
+			p.config.Labels[k] = v
+		}
+	} else {
+		p.config.Labels = defaultLabels
+	}
+	cfg.Labels = p.config.Labels
+
+	// Create the container
+	name := src.App + "-" + result.Id
+	cr, err := cli.ContainerCreate(ctx, &cfg, &hostconfig, &netconfig, nil, name)
+	if err != nil {
+		return status.Errorf(codes.Internal, "unable to create Docker container: %s", err)
+	}
+
+	// Store our state so we can destroy it properly
+	state.Id = cr.ID
+	state.Name = name
+
+	// Additional networks must be connected after container is created
+	if p.config.Networks != nil {
+		s.Update("Connecting additional networks to container...")
+		for _, net := range p.config.Networks {
+			err = cli.NetworkConnect(ctx, net, cr.ID, &network.EndpointSettings{})
+			if err != nil {
+				s.Update("Failed to connect additional network")
+				s.Status(terminal.StatusError)
+				s.Done()
+				return status.Errorf(
+					codes.Internal,
+					"unable to connect container to additional networks: %s",
+					err)
+			}
+		}
+	}
+
+	s.Update("Starting container")
+	err = cli.ContainerStart(ctx, cr.ID, types.ContainerStartOptions{})
+	if err != nil {
+		return status.Errorf(codes.Internal, "unable to start Docker container: %s", err)
+	}
+	s.Done()
+
+	return nil
+}
+
+func (p *Platform) resourceContainerDestroy(
+	ctx context.Context,
+	cli *client.Client,
+	state *Resource_Container,
+	sg terminal.StepGroup,
+) error {
+	// Check if the container exists
+	_, err := cli.ContainerInspect(ctx, state.Id)
+	if client.IsErrNotFound(err) {
+		return nil
+	}
+
+	s := sg.Add("Deleting container: %s", state.Id)
+	defer func() { s.Abort() }()
+
+	// Remove it
+	err = cli.ContainerRemove(ctx, state.Id, types.ContainerRemoveOptions{
+		Force: true,
+	})
+	if err != nil {
+		return err
+	}
+
+	s.Done()
+	return nil
+}
+
 // Deploy deploys an image to Docker.
 func (p *Platform) Deploy(
 	ctx context.Context,
@@ -89,20 +477,8 @@ func (p *Platform) Deploy(
 		p.config.ServicePort = 3000
 	}
 
-	cli, err := p.getDockerClient()
-	if err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "unable to create Docker client: %s", err)
-	}
-
-	cli.NegotiateAPIVersion(ctx)
-
-	// Pull the image
-	err = p.pullImage(cli, log, ui, img, p.config.ForcePull)
-	if err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "unable to pull image from Docker registry: %s", err)
-	}
-
-	// Create our deployment and set an initial ID
+	// Create our deployment and set an initial ID. This just creates
+	// the initial structure this doesn't persist any state yet.
 	var result Deployment
 	id, err := component.Id()
 	if err != nil {
@@ -111,196 +487,62 @@ func (p *Platform) Deploy(
 	result.Id = id
 	result.Name = src.App
 
-	s := sg.Add("Setting up waypoint network")
-	defer func() { s.Abort() }()
-
-	nets, err := cli.NetworkList(ctx, types.NetworkListOptions{
-		Filters: filters.NewArgs(filters.Arg("label", "use=waypoint")),
-	})
-
-	if err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "unable to list Docker networks: %s", err)
-	}
-
-	if len(nets) == 0 {
-		_, err = cli.NetworkCreate(ctx, "waypoint", types.NetworkCreate{
-			Driver:         "bridge",
-			CheckDuplicate: true,
-			Internal:       false,
-			Attachable:     true,
-			Labels: map[string]string{
-				"use": "waypoint",
-			},
-		})
-
-		if err != nil {
-			return nil, status.Errorf(codes.FailedPrecondition, "unable to create Docker network: %s", err)
-		}
-	}
-
-	s.Done()
-
-	s = sg.Add("Creating new container")
-
-	port := fmt.Sprint(p.config.ServicePort)
-	np, err := nat.NewPort("tcp", port)
-	if err != nil {
+	// Create our resource manager and create
+	rm := p.resourceManager(log)
+	if err := rm.CreateAll(
+		ctx, log, sg, ui,
+		src, job, img, deployConfig, &result,
+	); err != nil {
 		return nil, err
 	}
 
-	cfg := container.Config{
-		AttachStdout: true,
-		AttachStderr: true,
-		AttachStdin:  true,
-		OpenStdin:    true,
-		StdinOnce:    true,
-		Image:        img.Image + ":" + img.Tag,
-		ExposedPorts: nat.PortSet{np: struct{}{}},
-		Env:          []string{"PORT=" + port},
+	// Store our resource state
+	result.ResourceState = rm.State()
+
+	// Get our container state
+	crState := rm.Resource("container").State().(*Resource_Container)
+	if crState == nil {
+		return nil, status.Errorf(codes.Internal,
+			"container state is nil, this should never happen")
 	}
 
-	if c := p.config.Command; len(c) > 0 {
-		cfg.Cmd = c
-	}
-
-	bindings := nat.PortMap{}
-	bindings[np] = []nat.PortBinding{
-		{
-			HostPort: "", // this is intentionally left empty for a random host port assignment
-		},
-	}
-
-	// default container binds
-	containerBinds := []string{src.App + "-scratch" + ":/input"}
-	if p.config.Binds != nil {
-		containerBinds = append(containerBinds, p.config.Binds...)
-	}
-
-	var resources container.Resources
-	if p.config.Resources != nil {
-		memory, err := goUnits.FromHumanSize(p.config.Resources["memory"])
-		if err != nil {
-			return nil, err
-		}
-		resources.Memory = memory
-
-		cpu, err := strconv.ParseInt(p.config.Resources["cpu"], 10, 64)
-		if err != nil {
-			return nil, err
-		}
-		resources.CPUShares = cpu
-	}
-
-	hostconfig := container.HostConfig{
-		Binds:        containerBinds,
-		PortBindings: bindings,
-		Resources:    resources,
-	}
-
-	// Containers can only be connected to 1 network at creation time
-	// Additional user defined networks will be connected after container is
-	// created.
-	netconfig := network.NetworkingConfig{
-		EndpointsConfig: map[string]*network.EndpointSettings{
-			"waypoint": {},
-		},
-	}
-
-	for k, v := range p.config.StaticEnvVars {
-		cfg.Env = append(cfg.Env, k+"="+v)
-	}
-
-	for k, v := range deployConfig.Env() {
-		cfg.Env = append(cfg.Env, k+"="+v)
-	}
-
-	defaultLabels := map[string]string{
-		labelId:     result.Id,
-		"app":       src.App,
-		"workspace": job.Workspace,
-	}
-
-	if p.config.Labels != nil {
-		for k, v := range defaultLabels {
-			p.config.Labels[k] = v
-		}
-	} else {
-		p.config.Labels = defaultLabels
-	}
-
-	cfg.Labels = p.config.Labels
-
-	name := src.App + "-" + id
-
-	cr, err := cli.ContainerCreate(ctx, &cfg, &hostconfig, &netconfig, name)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "unable to create Docker container: %s", err)
-	}
-
-	// Additional networks must be connected after container is created
-	if p.config.Networks != nil {
-		s.Update("Connecting additional networks to container...")
-		for _, net := range p.config.Networks {
-			err = cli.NetworkConnect(ctx, net, cr.ID, &network.EndpointSettings{})
-			if err != nil {
-				s.Update("Failed to connect additional network")
-				s.Status(terminal.StatusError)
-				s.Done()
-				return nil, status.Errorf(
-					codes.Internal,
-					"unable to connect container to additional networks: %s",
-					err)
-			}
-		}
-	}
-
-	s.Update("Starting container")
-	err = cli.ContainerStart(ctx, cr.ID, types.ContainerStartOptions{})
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "unable to start Docker container: %s", err)
-	}
+	s := sg.Add("App deployed as container: " + crState.Name)
 	s.Done()
 
-	s = sg.Add("App deployed as container: " + name)
-	s.Done()
-
-	result.Container = cr.ID
-
+	result.Container = crState.Id
 	return &result, nil
 }
 
-// Destroy deletes the K8S deployment.
+// Destroy deletes a Docker deployment.
 func (p *Platform) Destroy(
 	ctx context.Context,
 	log hclog.Logger,
 	deployment *Deployment,
 	ui terminal.UI,
 ) error {
-	cli, err := p.getDockerClient()
-	if err != nil {
-		return status.Errorf(codes.FailedPrecondition, "unable to create Docker client: %s", err)
+	sg := ui.StepGroup()
+	defer sg.Wait()
+
+	rm := p.resourceManager(log)
+
+	// If we don't have resource state, this state is from an older version
+	// and we need to manually recreate it.
+	if deployment.ResourceState == nil {
+		rm.Resource("container").SetState(&Resource_Container{
+			Id: deployment.Container,
+		})
+	} else {
+		// Load our set state
+		if err := rm.LoadState(deployment.ResourceState); err != nil {
+			return err
+		}
 	}
 
-	cli.NegotiateAPIVersion(ctx)
-
-	// We'll update the user in real time
-	st := ui.Status()
-	defer st.Close()
-	st.Update("Deleting container...")
-
-	// Check if the container exists
-	_, err = cli.ContainerInspect(ctx, deployment.Container)
-	if client.IsErrNotFound(err) {
-		return nil
-	}
-
-	// Remove it
-	return cli.ContainerRemove(ctx, deployment.Container, types.ContainerRemoveOptions{
-		Force: true,
-	})
+	// Destroy
+	return rm.DestroyAll(ctx, log, sg, ui)
 }
 
-func (p *Platform) getDockerClient() (*client.Client, error) {
+func (p *Platform) getDockerClient(ctx context.Context) (*client.Client, error) {
 	if p.config.ClientConfig == nil {
 		return wpdockerclient.NewClientWithOpts(client.FromEnv)
 	}
@@ -323,7 +565,13 @@ func (p *Platform) getDockerClient() (*client.Client, error) {
 		opts = append(opts, client.WithVersion(version))
 	}
 
-	return wpdockerclient.NewClientWithOpts(opts...)
+	cli, err := wpdockerclient.NewClientWithOpts(opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	cli.NegotiateAPIVersion(ctx)
+	return cli, nil
 }
 
 func (p *Platform) pullImage(cli *client.Client, log hclog.Logger, ui terminal.UI, img *Image, force bool) error {
@@ -332,11 +580,13 @@ func (p *Platform) pullImage(cli *client.Client, log hclog.Logger, ui terminal.U
 	args.Add("reference", in)
 
 	sg := ui.StepGroup()
+	s := sg.Add("")
+	defer func() { s.Abort() }()
 
 	// only pull if image is not in current registry so check to see if the image is present
 	// if force then skip this check
 	if force == false {
-		sg.Add("Checking Docker image cache for Image " + in)
+		s.Update("Checking Docker image cache for Image " + in)
 
 		sum, err := cli.ImageList(context.Background(), types.ImageListOptions{Filters: args})
 		if err != nil {
@@ -345,12 +595,13 @@ func (p *Platform) pullImage(cli *client.Client, log hclog.Logger, ui terminal.U
 
 		// if we have images do not pull
 		if len(sum) > 0 {
+			s.Update("Docker image %q up to date!", in)
+			s.Done()
 			return nil
 		}
 	}
 
-	step := sg.Add("Pulling Docker Image " + in)
-	defer step.Abort()
+	s.Update("Pulling Docker Image " + in)
 
 	ipo := types.ImagePullOptions{}
 
@@ -380,10 +631,12 @@ func (p *Platform) pullImage(cli *client.Client, log hclog.Logger, ui terminal.U
 		termFd = f.Fd()
 	}
 
-	err = jsonmessage.DisplayJSONMessagesStream(out, step.TermOutput(), termFd, true, nil)
+	err = jsonmessage.DisplayJSONMessagesStream(out, s.TermOutput(), termFd, true, nil)
 	if err != nil {
 		return status.Errorf(codes.Internal, "unable to stream build logs to the terminal: %s", err)
 	}
+
+	s.Done()
 
 	return nil
 }
@@ -445,6 +698,9 @@ type PlatformConfig struct {
 	// selected via environment variable. Most configuration should use the waypoint
 	// config commands.
 	StaticEnvVars map[string]string `hcl:"static_environment,optional"`
+
+	// Additional ports the application is listening on to expose on the container
+	ExtraPorts []uint `hcl:"extra_ports,optional"`
 
 	// Port that your service is running on within the actual container.
 	// Defaults to port 3000.
@@ -555,6 +811,15 @@ deploy {
 	)
 
 	doc.SetField(
+		"extra_ports",
+		"additional TCP ports the application is listening on to expose on the container",
+		docs.Summary(
+			"Used to define and expose multiple ports that the application is listening on for the container in use.",
+			"These ports will get merged with service_port when creating the container if defined.",
+		),
+	)
+
+	doc.SetField(
 		"service_port",
 		"port that your service is running on in the container",
 		docs.Default("3000"),
@@ -585,7 +850,15 @@ deploy {
 }
 
 var (
+	mixedHealthWarn = strings.TrimSpace(`
+Waypoint detected that the current deployment is not ready, however your application
+might be available or still starting up.
+`)
+)
+
+var (
 	_ component.Platform     = (*Platform)(nil)
 	_ component.Configurable = (*Platform)(nil)
 	_ component.Destroyer    = (*Platform)(nil)
+	_ component.Status       = (*Platform)(nil)
 )

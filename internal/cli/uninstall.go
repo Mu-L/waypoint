@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -210,7 +211,8 @@ Usage: waypoint server uninstall [options]
   Uninstall the Waypoint server. The platform should be specified as kubernetes,
   nomad, or docker. '-auto-approve' is required.
 
-  By default, this command deletes the default server's context.
+  By default, this command deletes the default server's context and creates 
+  a server snapshot.
 
   This command does not destroy Waypoint resources, such as deployments and
   releases. Clear all workspaces prior to uninstall to prevent hanging resources.
@@ -271,7 +273,17 @@ func (c *UninstallCommand) Flags() *flag.Sets {
 				"the server is uninstalled.",
 		})
 
-		for name, platform := range serverinstall.Platforms {
+		// Add platforms in alphabetical order. A consistent order is important for repeatable doc generation.
+		i := 0
+		sortedPlatformNames := make([]string, len(serverinstall.Platforms))
+		for name := range serverinstall.Platforms {
+			sortedPlatformNames[i] = name
+			i++
+		}
+		sort.Strings(sortedPlatformNames)
+
+		for _, name := range sortedPlatformNames {
+			platform := serverinstall.Platforms[name]
 			platformSet := set.NewSet(name + " Options")
 			platform.UninstallFlags(platformSet)
 		}

@@ -10,7 +10,7 @@ var (
 	GitCommit   string
 	GitDescribe string
 
-	Version           = "0.2.0"
+	Version           = "0.4.0"
 	VersionPrerelease = ""
 	VersionMetadata   = ""
 )
@@ -72,7 +72,7 @@ func (c *VersionInfo) FullVersionNumber(rev bool) string {
 		return "Waypoint (version unknown)"
 	}
 
-	fmt.Fprintf(&versionString, "Waypoint %s", c.Version)
+	fmt.Fprintf(&versionString, "%s", c.Version)
 	if c.VersionPrerelease != "" && c.GitDescribe == "" {
 		fmt.Fprintf(&versionString, "-%s", c.VersionPrerelease)
 	}

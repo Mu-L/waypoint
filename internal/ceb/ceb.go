@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/hashicorp/waypoint/internal/env"
 	"github.com/hashicorp/waypoint/internal/pkg/gatedwriter"
 	"github.com/hashicorp/waypoint/internal/plugin"
 	"github.com/hashicorp/waypoint/internal/server"
@@ -31,6 +32,11 @@ const (
 	envCEBDisable          = "WAYPOINT_CEB_DISABLE"
 	envCEBServerRequired   = "WAYPOINT_CEB_SERVER_REQUIRED"
 	envCEBToken            = "WAYPOINT_CEB_INVITE_TOKEN"
+
+	// envLogLevel is the env var to set with the log level. This
+	// env var matches the Waypoint CLI on purpose. This can be set on
+	// the entrypoint process OR via app config (`waypoint config`).
+	envLogLevel = "WAYPOINT_LOG_LEVEL"
 )
 
 const (
@@ -70,6 +76,9 @@ type CEB struct {
 	clientMu   sync.Mutex
 	clientCond *sync.Cond
 	client     pb.WaypointClient
+
+	// childSigCh can be sent signals which will be sent to the child command via kill(2).
+	childSigCh chan os.Signal
 
 	// childDoneCh is sent a value (incl. nil) when the child process exits.
 	// This is not sent anything for restarts.
@@ -263,6 +272,7 @@ type config struct {
 	ServerTls           bool
 	ServerTlsSkipVerify bool
 	InviteToken         string
+	FileRewriteSignal   string
 
 	URLServicePort int
 }
@@ -290,11 +300,29 @@ func WithEnvDefaults() Option {
 
 		cfg.URLServicePort = port
 		cfg.ServerAddr = os.Getenv(envServerAddr)
-		cfg.ServerRequired = os.Getenv(envCEBServerRequired) != ""
-		cfg.ServerTls = os.Getenv(envServerTls) != ""
-		cfg.ServerTlsSkipVerify = os.Getenv(envServerTlsSkipVerify) != ""
+
+		var err error
+		cfg.ServerRequired, err = env.GetBool(envCEBServerRequired, false)
+		if err != nil {
+			return err
+		}
+
+		cfg.ServerTls, err = env.GetBool(envServerTls, false)
+		if err != nil {
+			return err
+		}
+
+		cfg.ServerTlsSkipVerify, err = env.GetBool(envServerTlsSkipVerify, false)
+		if err != nil {
+			return err
+		}
+
 		cfg.InviteToken = os.Getenv(envCEBToken)
-		cfg.disable = os.Getenv(envCEBDisable) != ""
+
+		cfg.disable, err = env.GetBool(envCEBDisable, false)
+		if err != nil {
+			return err
+		}
 
 		ceb.deploymentId = os.Getenv(envDeploymentId)
 

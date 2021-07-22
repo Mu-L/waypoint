@@ -12,6 +12,7 @@ import (
 
 	"github.com/hashicorp/waypoint/internal/server"
 	pb "github.com/hashicorp/waypoint/internal/server/gen"
+	"github.com/hashicorp/waypoint/internal/server/ptypes"
 	"github.com/hashicorp/waypoint/internal/server/singleprocess/state"
 )
 
@@ -89,16 +90,26 @@ func (s *service) ListDeployments(
 	}
 
 	for _, dep := range result {
+		setDeploymentUrlIfNeeded(dep)
 		if err := s.deploymentPreloadUrl(ctx, dep); err != nil {
 			return nil, err
 		}
-
 		if err := s.deploymentPreloadDetails(ctx, req.LoadDetails, dep); err != nil {
 			return nil, err
 		}
 	}
 
 	return &pb.ListDeploymentsResponse{Deployments: result}, nil
+}
+
+func setDeploymentUrlIfNeeded(d *pb.Deployment) {
+	if d.Url != "" {
+		if d.Preload == nil {
+			d.Preload = &pb.Deployment_Preload{}
+		}
+
+		d.Preload.DeployUrl = d.Url
+	}
 }
 
 // GetDeployment returns a Deployment based on ID
@@ -110,6 +121,8 @@ func (s *service) GetDeployment(
 	if err != nil {
 		return nil, err
 	}
+
+	setDeploymentUrlIfNeeded(d)
 
 	// Populate the URL preload data
 	if err := s.deploymentPreloadUrl(ctx, d); err != nil {
@@ -145,9 +158,9 @@ func (s *service) deploymentPreloadUrl(
 		hostname := resp.Hostnames[0]
 
 		d.Preload.DeployUrl = fmt.Sprintf(
-			"%s--v%d%s",
+			"%s--%s%s",
 			hostname.Hostname,
-			d.Sequence,
+			(&ptypes.Deployment{Deployment: d}).URLFragment(),
 			strings.TrimPrefix(hostname.Fqdn, hostname.Hostname),
 		)
 	}

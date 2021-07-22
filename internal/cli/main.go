@@ -18,6 +18,7 @@ import (
 	"github.com/mitchellh/go-glint"
 
 	"github.com/hashicorp/waypoint-plugin-sdk/terminal"
+	"github.com/hashicorp/waypoint/internal/env"
 	"github.com/hashicorp/waypoint/internal/pkg/signalcontext"
 	"github.com/hashicorp/waypoint/internal/version"
 )
@@ -37,6 +38,7 @@ var (
 	// commonCommands are the commands that are deemed "common" and shown first
 	// in the CLI help output.
 	commonCommands = []string{
+		"login",
 		"build",
 		"deploy",
 		"release",
@@ -46,6 +48,9 @@ var (
 	// hiddenCommands are not shown in CLI help output.
 	hiddenCommands = map[string]struct{}{
 		"plugin": {},
+
+		// Deprecated:
+		"token": {}, // replaced by "user"
 	}
 
 	ExposeDocs bool
@@ -90,15 +95,29 @@ func Main(args []string) int {
 	base, commands := Commands(ctx, log, logOutput)
 	defer base.Close()
 
-	// Build the CLI
-	cli := &cli.CLI{
-		Name:                       args[0],
-		Args:                       args[1:],
-		Version:                    vsn.FullVersionNumber(true),
-		Commands:                   commands,
-		Autocomplete:               true,
-		AutocompleteNoDefaultFlags: true,
-		HelpFunc:                   GroupedHelpFunc(cli.BasicHelpFunc(cliName)),
+	// Build the CLI. We use a CLI factory function because to modify the
+	// args once you call a func on CLI you need to create a new CLI instance.
+	cliFactory := func() *cli.CLI {
+		return &cli.CLI{
+			Name:                       args[0],
+			Args:                       args[1:],
+			Version:                    vsn.FullVersionNumber(true),
+			Commands:                   commands,
+			Autocomplete:               true,
+			AutocompleteNoDefaultFlags: true,
+			HelpFunc:                   GroupedHelpFunc(cli.BasicHelpFunc(cliName)),
+		}
+	}
+
+	// Copy the CLI to check if it is a version call. If so, we modify
+	// the args to just be the version subcommand. This ensures that
+	// --version behaves by calling `waypoint version` and we get consistent
+	// behavior.
+	cli := cliFactory()
+	if cli.IsVersion() {
+		// We need to reinit because you can't modify fields after calling funcs
+		cli = cliFactory()
+		cli.Args = []string{"version"}
 	}
 
 	// Run the CLI
@@ -125,7 +144,11 @@ func Commands(
 	}
 
 	// Set plain mode if set
-	if os.Getenv(EnvPlain) != "" {
+	outputModeBool, err := env.GetBool(EnvPlain, false)
+	if err != nil {
+		log.Warn(err.Error())
+	}
+	if outputModeBool {
 		baseCommand.globalOptions = append(baseCommand.globalOptions,
 			WithUI(terminal.NonInteractiveUI(ctx)))
 	}
@@ -140,6 +163,12 @@ func Commands(
 
 	// start building our commands
 	commands := map[string]cli.CommandFactory{
+		"login": func() (cli.Command, error) {
+			return &LoginCommand{
+				baseCommand: baseCommand,
+			}, nil
+		},
+
 		"init": func() (cli.Command, error) {
 			return &InitCommand{
 				baseCommand: baseCommand,
@@ -376,9 +405,15 @@ func Commands(
 		},
 
 		"context": func() (cli.Command, error) {
-			return &helpCommand{
+			return &ContextHelpCommand{
+				baseCommand:  baseCommand,
 				SynopsisText: helpText["context"][0],
 				HelpText:     helpText["context"][1],
+			}, nil
+		},
+		"context inspect": func() (cli.Command, error) {
+			return &ContextInspectCommand{
+				baseCommand: baseCommand,
 			}, nil
 		},
 		"context create": func() (cli.Command, error) {
@@ -429,6 +464,12 @@ func Commands(
 			}, nil
 		},
 
+		"project": func() (cli.Command, error) {
+			return &helpCommand{
+				SynopsisText: helpText["project"][0],
+				HelpText:     helpText["project"][1],
+			}, nil
+		},
 		"project list": func() (cli.Command, error) {
 			return &ProjectListCommand{
 				baseCommand: baseCommand,
@@ -442,6 +483,75 @@ func Commands(
 
 		"fmt": func() (cli.Command, error) {
 			return &FmtCommand{
+				baseCommand: baseCommand,
+			}, nil
+		},
+
+		"auth-method": func() (cli.Command, error) {
+			return &helpCommand{
+				SynopsisText: helpText["auth-method"][0],
+				HelpText:     helpText["auth-method"][1],
+			}, nil
+		},
+
+		"auth-method set": func() (cli.Command, error) {
+			return &helpCommand{
+				SynopsisText: helpText["auth-method-set"][0],
+				HelpText:     helpText["auth-method-set"][1],
+			}, nil
+		},
+
+		"auth-method set oidc": func() (cli.Command, error) {
+			return &AuthMethodSetOIDCCommand{
+				baseCommand: baseCommand,
+			}, nil
+		},
+
+		"auth-method inspect": func() (cli.Command, error) {
+			return &AuthMethodInspectCommand{
+				baseCommand: baseCommand,
+			}, nil
+		},
+
+		"auth-method delete": func() (cli.Command, error) {
+			return &AuthMethodDeleteCommand{
+				baseCommand: baseCommand,
+			}, nil
+		},
+
+		"auth-method list": func() (cli.Command, error) {
+			return &AuthMethodListCommand{
+				baseCommand: baseCommand,
+			}, nil
+		},
+
+		"user": func() (cli.Command, error) {
+			return &helpCommand{
+				SynopsisText: helpText["user"][0],
+				HelpText:     helpText["user"][1],
+			}, nil
+		},
+
+		"user inspect": func() (cli.Command, error) {
+			return &UserInspectCommand{
+				baseCommand: baseCommand,
+			}, nil
+		},
+
+		"user modify": func() (cli.Command, error) {
+			return &UserModifyCommand{
+				baseCommand: baseCommand,
+			}, nil
+		},
+
+		"user invite": func() (cli.Command, error) {
+			return &UserInviteCommand{
+				baseCommand: baseCommand,
+			}, nil
+		},
+
+		"user token": func() (cli.Command, error) {
+			return &UserTokenCommand{
 				baseCommand: baseCommand,
 			}, nil
 		},
@@ -652,6 +762,30 @@ Waypoint will search for artifacts to pass to the deployment phase.
 `,
 	},
 
+	"auth-method": {
+		"Auth Method Management",
+		`
+Auth Method Management
+
+The auth-method commands can be used to manage how users can authenticate
+into the Waypoint server. For day-to-day Waypoint users, you likely want
+to use the "waypoint login" command or "waypoint user" commands. The
+auth-method subcommand is primarily aimed at Waypoint server operators.
+`,
+	},
+
+	"auth-method-set": {
+		"Create or update an auth method",
+		`
+Create or update an auth method.
+
+This command can be used to configure a new auth method or update
+an existing auth method. Use the specific auth-method type subcommand.
+Once the auth method is created it is immediately available for use by
+end users.
+`,
+	},
+
 	"config": {
 		"Application configuration management",
 		`
@@ -701,6 +835,16 @@ For more information see: https://waypointproject.io/docs/url
 `,
 	},
 
+	"project": {
+		"Project management",
+		`
+Project management.
+
+Projects are comprised of one or more applications. A project maps
+to a VCS repository (if one exists).
+`,
+	},
+
 	"runner": {
 		"Runner management",
 		`
@@ -732,6 +876,20 @@ Authenticate and invite collaborators.
 
 Tokens are the primary form of authentication to Waypoint. Everyone who
 accesses a Waypoint server requires a token.
+`,
+	},
+
+	"user": {
+		"User information and management",
+		`
+View, manage, and invite users.
+
+Everyone who uses Waypoint is represented as a Waypoint user, including
+token authentication. This subcommand can be used to inspect information
+about the currently logged in user, generate new access, and invite new
+users directly into the Waypoint server.
+
+If you are looking to log in to Waypoint, use "waypoint login".
 `,
 	},
 }

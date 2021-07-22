@@ -3,17 +3,24 @@ package serverclient
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"os"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 
 	"github.com/hashicorp/waypoint/internal/clicontext"
+	"github.com/hashicorp/waypoint/internal/env"
 	"github.com/hashicorp/waypoint/internal/protocolversion"
 	"github.com/hashicorp/waypoint/internal/serverconfig"
 )
+
+// ErrNoServerConfig is the error when there is no server configuration
+// found for connection.
+var ErrNoServerConfig = errors.New("no server connection configuration found")
 
 // ConnectOption is used to configure how Waypoint server connection
 // configuration is sourced.
@@ -40,7 +47,7 @@ func Connect(ctx context.Context, opts ...ConnectOption) (*grpc.ClientConn, erro
 			return nil, nil
 		}
 
-		return nil, fmt.Errorf("no server credentials found")
+		return nil, ErrNoServerConfig
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
@@ -51,6 +58,13 @@ func Connect(ctx context.Context, opts ...ConnectOption) (*grpc.ClientConn, erro
 		grpc.WithBlock(),
 		grpc.WithUnaryInterceptor(protocolversion.UnaryClientInterceptor(protocolversion.Current())),
 		grpc.WithStreamInterceptor(protocolversion.StreamClientInterceptor(protocolversion.Current())),
+		grpc.WithKeepaliveParams(
+			keepalive.ClientParameters{
+				// ping after this amount of time of inactivity
+				Time: 30 * time.Second,
+				// send keepalive pings even if there is no active streams
+				PermitWithoutStream: true,
+			}),
 	}
 
 	if !cfg.Tls {
@@ -58,6 +72,10 @@ func Connect(ctx context.Context, opts ...ConnectOption) (*grpc.ClientConn, erro
 	} else if cfg.TlsSkipVerify {
 		grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(
 			credentials.NewTLS(&tls.Config{InsecureSkipVerify: true}),
+		))
+	} else {
+		grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(
+			credentials.NewTLS(&tls.Config{}),
 		))
 	}
 
@@ -117,8 +135,18 @@ func FromEnv() ConnectOption {
 	return func(c *connectConfig) error {
 		if v := os.Getenv(EnvServerAddr); v != "" {
 			c.Addr = v
-			c.Tls = os.Getenv(EnvServerTls) != ""
-			c.TlsSkipVerify = os.Getenv(EnvServerTlsSkipVerify) != ""
+
+			var err error
+			c.Tls, err = env.GetBool(EnvServerTls, false)
+			if err != nil {
+				return err
+			}
+
+			c.TlsSkipVerify, err = env.GetBool(EnvServerTlsSkipVerify, false)
+			if err != nil {
+				return err
+			}
+
 			c.Auth = os.Getenv(EnvServerToken) != ""
 		}
 

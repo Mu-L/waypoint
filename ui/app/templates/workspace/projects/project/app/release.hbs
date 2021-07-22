@@ -1,30 +1,29 @@
+{{page-title (concat "Release" " v" @model.sequence)}}
+
 <PageHeader @iconName="public-default">
   <div class="title">
-    <h2><b class="badge badge--version">v{{@model.sequence}}</b> <code>{{ @model.id }}</code></h2>
+    {{! TODO(jgwhite): Make this a real <h1> }}
+    <h2 aria-level="1"><b class="badge badge--version">v{{@model.sequence}}</b></h2>
     <small>
-      {{inline-svg (icon-for-component @model.component.name) class="icon"}}
+      <Pds::Icon @type={{icon-for-component @model.component.name}} class="icon" />
       <span>Released on <b>{{component-name @model.component.name}}</b>
         {{date-format-distance-to-now @model.status.startTime.seconds }}</span>
     </small>
   </div>
   <div class="actions">
     {{#if @isLatest}}
-    <button class="button button--primary">
+    <button class="button button--primary" type="button">
       <span>{{@model.release.url}}</span>
-      {{inline-svg "exit" class="icon"}}
+      <Pds::Icon @type="exit" class="icon" />
     </button>
     {{/if}}
   </div>
 </PageHeader>
 
-<div class="item-row">
+<div class="status-row">
   <div class="item">
-    {{#if (eq @model.state 1)}}
-    <b class="badge">{{t 'state.release.pending'}}</b>
-    {{else if (eq @model.status.state 2)}}
-    <b class="badge badge--success">{{t 'state.release.success'}}</b>
-    {{else if (eq @model.status.state 3)}}
-    <b class="badge badge--error">{{t 'state.release.error'}}</b>
+    {{#if @model.statusReport}}
+      <StatusReportIndicator @statusReport={{@model.statusReport}} />
     {{/if}}
   </div>
 

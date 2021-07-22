@@ -49,6 +49,13 @@ app "wpmini" {
       auto_scaling {
         max = 10
       }
+
+      cloudsql_instances = ["waypoint-project-id:europe-north1:sql-instance"]
+
+      vpc_access {
+        connector = "custom-vpc-connector"
+        egress = "all"
+      }
     }
   }
 
@@ -66,7 +73,7 @@ These parameters are used in the [`use` stanza](/docs/waypoint-hcl/use) for this
 
 Configuration to control the auto scaling parameters for Cloud Run.
 
-- Type: **\*cloudrun.AutoScaling**
+- Type: **cloudrun.AutoScaling**
 
 #### auto_scaling.max
 
@@ -77,7 +84,7 @@ This parameter controls the maximum number of instances that can be created.
 
 CPU, Memory, and resource limits for each Cloud Run instance.
 
-- Type: **\*cloudrun.Capacity**
+- Type: **cloudrun.Capacity**
 
 #### capacity.cpu_count
 
@@ -107,9 +114,28 @@ GCP project ID where the Cloud Run instance will be deployed.
 
 - Type: **string**
 
+#### vpc_access
+
+- Type: **cloudrun.VPCAccess**
+
+#### vpc_access.connector
+
+Set VPC Access Connector for the Cloud Run instance.
+
+#### vpc_access.egress
+
+Set VPC egress. Supported values are 'all' and 'private-ranges-only'.
+
 ### Optional Parameters
 
 These parameters are used in the [`use` stanza](/docs/waypoint-hcl/use) for this plugin.
+
+#### cloudsql_instances
+
+Specify list of CloudSQL instances that the Cloud Run instance will have access to.
+
+- Type: **list of string**
+- **Optional**
 
 #### port
 
@@ -129,14 +155,14 @@ Specify a service account email that Cloud Run will use to run the service. You 
 
 Additional environment variables to be added to the Cloud Run instance.
 
-- Type: **map[string]string**
+- Type: **map of string to string**
 - **Optional**
 
 #### unauthenticated
 
 Is public unauthenticated access allowed for the Cloud Run instance?.
 
-- Type: **\*bool**
+- Type: **bool**
 - **Optional**
 
 ### Output Attributes
@@ -153,7 +179,7 @@ Output attributes can be used in your `waypoint.hcl` as [variables](/docs/waypoi
 
 #### resource
 
-- Type: **\*cloudrun.Deployment_Resource**
+- Type: **cloudrun.Deployment_Resource**
 
 #### revision_id
 

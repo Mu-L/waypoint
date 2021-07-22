@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/golang/protobuf/ptypes"
 	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/waypoint/internal/clierrors"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/hashicorp/waypoint-plugin-sdk/component"
 	"github.com/hashicorp/waypoint-plugin-sdk/docs"
+	sdk "github.com/hashicorp/waypoint-plugin-sdk/proto/gen"
 	"github.com/hashicorp/waypoint-plugin-sdk/terminal"
 )
 
@@ -41,6 +45,11 @@ func (r *Releaser) DestroyFunc() interface{} {
 	return r.Destroy
 }
 
+// StatusFunc implements component.Status
+func (r *Releaser) StatusFunc() interface{} {
+	return r.Status
+}
+
 // Release creates a Kubernetes service configured for the deployment
 func (r *Releaser) Release(
 	ctx context.Context,
@@ -54,7 +63,7 @@ func (r *Releaser) Release(
 
 	sg := ui.StepGroup()
 	step := sg.Add("Initializing Kubernetes client...")
-	defer step.Abort()
+	defer func() { step.Abort() }() // Defer in func in case more steps are added to this func in the future
 
 	// Get our clientset
 	clientset, ns, config, err := clientset(r.config.KubeconfigPath, r.config.Context)
@@ -161,6 +170,9 @@ func (r *Releaser) Release(
 
 	service.Spec.Ports = servicePorts
 
+	// Apply Service annotations
+	service.Annotations = r.config.Annotations
+
 	// Create/update
 	if create {
 		step.Update("Creating service...")
@@ -265,8 +277,91 @@ func (r *Releaser) Destroy(
 	return nil
 }
 
+func (r *Releaser) Status(
+	ctx context.Context,
+	log hclog.Logger,
+	release *Release,
+	ui terminal.UI,
+) (*sdk.StatusReport, error) {
+	sg := ui.StepGroup()
+	defer sg.Wait()
+
+	step := sg.Add("Gathering health report for Kubernetes platform...")
+	defer step.Abort()
+
+	// Get our client
+	clientset, namespace, _, err := clientset(r.config.KubeconfigPath, r.config.Context)
+	if err != nil {
+		return nil, err
+	}
+	if r.config.Namespace != "" {
+		namespace = r.config.Namespace
+	}
+
+	serviceclient := clientset.CoreV1().Services(namespace)
+	service, err := serviceclient.Get(ctx, release.ServiceName, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	appName := service.Spec.Selector["name"]
+	podClient := clientset.CoreV1().Pods(namespace)
+	podLabelId := fmt.Sprintf("app=%s", appName)
+	podList, err := podClient.List(ctx, metav1.ListOptions{LabelSelector: podLabelId})
+	if err != nil {
+		ui.Output(
+			"Error listing pods to determine application health: %s", clierrors.Humanize(err),
+			terminal.WithErrorStyle(),
+		)
+		return nil, err
+	}
+
+	// Create our status report
+	step.Update("Building status report for running pods...")
+	result := buildStatusReport(podList)
+
+	result.GeneratedTime = ptypes.TimestampNow()
+	log.Debug("status report complete")
+
+	// update output based on main health state
+	step.Update("Finished building report for Kubernetes platform")
+	step.Done()
+
+	// NOTE(briancain): Replace ui.Status with StepGroups once this bug
+	// has been fixed: https://github.com/hashicorp/waypoint/issues/1536
+	st := ui.Status()
+	defer st.Close()
+
+	st.Update("Determining overall container health...")
+	if result.Health == sdk.StatusReport_READY {
+		st.Step(terminal.StatusOK, fmt.Sprintf("Release %q is reporting ready!", appName))
+	} else {
+		if result.Health == sdk.StatusReport_PARTIAL {
+			st.Step(terminal.StatusWarn, fmt.Sprintf("Release %q is reporting partially available!", appName))
+		} else {
+			st.Step(terminal.StatusError, fmt.Sprintf("Release %q is reporting not ready!", appName))
+		}
+
+		// Extra advisory wording to let user know that the deployment could be still starting up
+		// if the report was generated immediately after it was deployed or released.
+		st.Step(terminal.StatusWarn, mixedHealthReleaseWarn)
+	}
+
+	// More UI detail for non-ready resources
+	for _, resource := range result.Resources {
+		if resource.Health != sdk.StatusReport_READY {
+			st.Step(terminal.StatusWarn, fmt.Sprintf("Resource %q is reporting %q", resource.Name, resource.Health.String()))
+		}
+	}
+
+	return &result, nil
+}
+
 // ReleaserConfig is the configuration structure for the Releaser.
 type ReleaserConfig struct {
+	// Annotations to be applied to the kube service.
+	Annotations map[string]string `hcl:"annotations,optional"`
+
 	// KubeconfigPath is the path to the kubeconfig file. If this is
 	// blank then we default to the home directory.
 	KubeconfigPath string `hcl:"kubeconfig,optional"`
@@ -367,8 +462,16 @@ func (r *Releaser) Documentation() (*docs.Documentation, error) {
 }
 
 var (
+	mixedHealthReleaseWarn = strings.TrimSpace(`
+Waypoint detected that the current release is not ready, however your application
+might be available or still starting up.
+`)
+)
+
+var (
 	_ component.ReleaseManager = (*Releaser)(nil)
 	_ component.Destroyer      = (*Releaser)(nil)
 	_ component.Configurable   = (*Releaser)(nil)
 	_ component.Documented     = (*Releaser)(nil)
+	_ component.Status         = (*Releaser)(nil)
 )

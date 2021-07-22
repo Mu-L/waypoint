@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -47,34 +48,6 @@ func (c *ServerUpgradeCommand) Run(args []string) int {
 		return 1
 	}
 
-	// Error handling from input
-
-	if !c.confirm {
-		c.ui.Output(confirmReqMsg, terminal.WithErrorStyle())
-		return 1
-	}
-
-	if c.platform == "" {
-		c.ui.Output(
-			"A platform is required and must match the server context",
-			terminal.WithErrorStyle(),
-		)
-		return 1
-	}
-
-	p, ok := serverinstall.Platforms[strings.ToLower(c.platform)]
-	if !ok {
-		c.ui.Output(
-			"Error upgrading server on %s: unsupported platform",
-			c.platform,
-			terminal.WithErrorStyle(),
-		)
-
-		return 1
-	}
-
-	// Finish error handling
-
 	// Get Server config to preserve existing configurations from context
 	var ctxName string
 	if c.contextName != "" {
@@ -102,6 +75,41 @@ func (c *ServerUpgradeCommand) Run(args []string) int {
 		)
 		return 1
 	}
+
+	// Default the platform to the platform from the context
+	if c.platform == "" {
+		c.platform = originalCfg.Server.Platform
+	}
+
+	// Error handling from input
+
+	if !c.confirm {
+		c.ui.Output(confirmReqMsg, terminal.WithErrorStyle())
+		if c.platform == "" {
+			c.ui.Output(platformReqMsg, terminal.WithErrorStyle())
+			c.ui.Output(c.Help(), terminal.WithErrorStyle())
+		}
+		return 1
+	} else if c.platform == "" {
+		c.ui.Output(
+			platformReqMsg,
+			terminal.WithErrorStyle(),
+		)
+		return 1
+	}
+
+	p, ok := serverinstall.Platforms[strings.ToLower(c.platform)]
+	if !ok {
+		c.ui.Output(
+			"Error upgrading server on %s: unsupported platform",
+			c.platform,
+			terminal.WithErrorStyle(),
+		)
+
+		return 1
+	}
+
+	// Finish error handling
 
 	// Upgrade waypoint server
 	sg := c.ui.StepGroup()
@@ -228,7 +236,12 @@ func (c *ServerUpgradeCommand) Run(args []string) int {
 	httpAddr := result.HTTPAddr
 
 	// We update the context config if the server addr has changed between upgrades
-	if originalCfg.Server.Address != contextConfig.Server.Address {
+	if originalCfg.Server.Address != contextConfig.Server.Address ||
+		originalCfg.Server.Platform != c.platform {
+		// Update the platform here, basically to upgrade an older context that didn't
+		// have platform set.
+		originalCfg.Server.Platform = c.platform
+
 		originalCfg.Server.Address = contextConfig.Server.Address
 
 		if err := c.contextStorage.Set(ctxName, originalCfg); err != nil {
@@ -386,7 +399,8 @@ func (c *ServerUpgradeCommand) Flags() *flag.Sets {
 			Name:    "platform",
 			Target:  &c.platform,
 			Default: "",
-			Usage:   "Platform to upgrade the Waypoint server from.",
+			Usage: "Platform to upgrade the Waypoint server from, " +
+				"defaults to the platform stored in the context.",
 		})
 		f.StringVar(&flag.StringVar{
 			Name:    "snapshot-name",
@@ -402,7 +416,17 @@ func (c *ServerUpgradeCommand) Flags() *flag.Sets {
 			Usage:   "Enable or disable taking a snapshot of Waypoint server prior to upgrades.",
 		})
 
-		for name, platform := range serverinstall.Platforms {
+		// Add platforms in alphabetical order. A consistent order is important for repeatable doc generation.
+		i := 0
+		sortedPlatformNames := make([]string, len(serverinstall.Platforms))
+		for name := range serverinstall.Platforms {
+			sortedPlatformNames[i] = name
+			i++
+		}
+		sort.Strings(sortedPlatformNames)
+
+		for _, name := range sortedPlatformNames {
+			platform := serverinstall.Platforms[name]
 			platformSet := set.NewSet(name + " Options")
 			platform.UpgradeFlags(platformSet)
 		}
@@ -442,6 +466,11 @@ var (
 	confirmReqMsg       = strings.TrimSpace(`
 Upgrading Waypoint server requires confirmation.
 Rerun the command with '-auto-approve' to continue with the upgrade.
+`)
+	platformReqMsg = strings.TrimSpace(`
+A platform is required and must match the server context.
+Rerun the command with '-platform=' and include the platform of the context to
+upgrade.
 `)
 	upgradeFailHelp = strings.TrimSpace(`
 Upgrading Waypoint server has failed. To restore from a snapshot, use the command:

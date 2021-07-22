@@ -16,7 +16,6 @@ func TestConfigValidate(t *testing.T) {
 			"valid.hcl",
 			"",
 		},
-
 		{
 			"no_build.hcl",
 			"'build' stanza",
@@ -27,7 +26,7 @@ func TestConfigValidate(t *testing.T) {
 		t.Run(tt.File, func(t *testing.T) {
 			require := require.New(t)
 
-			cfg, err := Load(filepath.Join("testdata", "validate", tt.File), "")
+			cfg, err := Load(filepath.Join("testdata", "validate", tt.File), nil)
 			require.NoError(err)
 
 			err = cfg.Validate()

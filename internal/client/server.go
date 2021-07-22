@@ -2,13 +2,14 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"path/filepath"
 	"time"
 
-	"github.com/boltdb/bolt"
 	"github.com/golang/protobuf/ptypes/empty"
+	bolt "go.etcd.io/bbolt"
 	"google.golang.org/grpc"
 
 	"github.com/hashicorp/waypoint/internal/protocolversion"
@@ -93,7 +94,7 @@ func (c *Project) initLocalServer(ctx context.Context) (*grpc.ClientConn, error)
 		Timeout: 1 * time.Second,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed opening boltdb path %s. Is another server already running against this db?: %w", path, err)
 	}
 	closers = append(closers, db)
 
@@ -101,6 +102,7 @@ func (c *Project) initLocalServer(ctx context.Context) (*grpc.ClientConn, error)
 	impl, err := singleprocess.New(
 		singleprocess.WithDB(db),
 		singleprocess.WithLogger(log.Named("singleprocess")),
+		singleprocess.WithSuperuser(), // local mode has no auth
 	)
 	if err != nil {
 		return nil, err
@@ -186,6 +188,9 @@ func (c *Project) negotiateApiVersion(ctx context.Context) error {
 		"entrypoint_min", resp.Info.Entrypoint.Minimum,
 		"entrypoint_current", resp.Info.Entrypoint.Current,
 	)
+
+	// Store the server version info
+	c.serverVersion = resp.Info
 
 	vsn, err := protocolversion.Negotiate(protocolversion.Current().Api, resp.Info.Api)
 	if err != nil {

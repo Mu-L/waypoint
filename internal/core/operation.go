@@ -21,7 +21,9 @@ import (
 // as build, deploy, push, etc. This lets us share logic around creating
 // server metadata, error checking, etc.
 type operation interface {
-	// Init returns a new metadata message we'll upsert
+	// Init returns a new metadata message we'll upsert. This is the first
+	// function called before any other operation logic is executed and so
+	// can be used to initialize state for the other callbacks.
 	Init(*App) (proto.Message, error)
 
 	// Upsert performs an upsert operation for some metadata
@@ -54,14 +56,14 @@ func (a *App) doOperation(
 	log hclog.Logger,
 	op operation,
 ) (interface{}, proto.Message, error) {
-	// Get our hooks
-	hooks := op.Hooks(a)
-
 	// Init the metadata
 	msg, err := op.Init(a)
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// Get our hooks
+	hooks := op.Hooks(a)
 
 	// Initialize our labels
 	msgUpdateLabels(a, op.Labels(a), msg, nil)
@@ -128,6 +130,9 @@ func (a *App) doOperation(
 			// Set our labels if we can
 			msgUpdateLabels(a, op.Labels(a), msg, result)
 
+			// Set the deployment URL, if possible
+			msgUpdateURL(msg, result)
+
 			// Set our template data. Any errors here are logged but ignored
 			// since we don't want to leave dangling physical resources.
 			if err := msgUpdateTemplateData(msg, result); err != nil {
@@ -156,7 +161,7 @@ func (a *App) doOperation(
 				log.Warn("error running after hook", "err", err)
 
 				if h.ContinueOnFailure() {
-					log.Info("hook configured to continueon failure, ignoring error")
+					log.Info("hook configured to continue on failure, ignoring error")
 					doErr = nil
 				}
 			}
@@ -192,6 +197,18 @@ func (a *App) doOperation(
 	}
 
 	return result, msg, nil
+}
+
+func msgUpdateURL(msg proto.Message, result interface{}) {
+	val := msgField(msg, "Url")
+	if !val.IsValid() {
+		return
+	}
+
+	switch t := result.(type) {
+	case component.DeploymentWithUrl:
+		val.SetString(t.URL())
+	}
 }
 
 func msgUpdateLabels(

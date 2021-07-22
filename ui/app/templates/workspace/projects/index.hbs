@@ -1,14 +1,16 @@
+{{page-title "Projects"}}
+
 {{#if this.cli}}
 <div class="flash flash--success">
   <div class="flash-header">
-    {{inline-svg "check-circle-fill" class="icon"}}
+    <Pds::Icon @type="check-circle-fill" class="icon" />
     <p>Authenticated successfully via the Waypoint CLI</p>
   </div>
 </div>
 {{/if}}
 
-<PageHeader>
-  <div class="title projects-title">
+<PageHeader @className="projects-header">
+  <div class="title">
     <h1>Projects</h1>
     <small>
       {{#if @model.length}}
@@ -18,9 +20,13 @@
       {{/if}}
     </small>
   </div>
+  <Pds::CtaLink @route="workspace.projects.new" @variant="secondary "class="pds--iconStart">
+    <Pds::Icon @type="plus-plain" class="pds-button__iconStart"/>
+    &nbsp;{{t "form.project_new.title"}}
+  </Pds::CtaLink>
 </PageHeader>
 
-<div data-test-project-list=true>
+<div data-test-project-list>
   {{#each @model as |project|}}
   <Card>
     <LinkTo @route="workspace.projects.project" @model={{project.project}}>

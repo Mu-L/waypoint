@@ -11,7 +11,7 @@ deploy {
         use "nomad" {
           region = "global"
           datacenter = "dc1"
-          auth = {
+          auth {
             username = "username"
             password = "password"
           }
@@ -33,7 +33,27 @@ These parameters are used in the [`use` stanza](/docs/waypoint-hcl/use) for this
 
 The credentials for docker registry.
 
-- Type: **\*nomad.AuthConfig**
+- Type: **nomad.AuthConfig**
+
+#### resources (category)
+
+The amount of resources to allocate to the deployed allocation.
+
+##### resources.cpu
+
+Amount of CPU in MHz to allocate to this task.
+
+- Type: **int**
+- **Optional**
+- Default: 100
+
+##### resources.memorymb
+
+Amount of memory in MB to allocate to this task.
+
+- Type: **int**
+- **Optional**
+- Default: 300
 
 ### Optional Parameters
 
@@ -81,7 +101,7 @@ TCP port the job is listening on.
 
 Environment variables to add to the job.
 
-- Type: **map[string]string**
+- Type: **map of string to string**
 - **Optional**
 
 ### Output Attributes

@@ -1,7 +1,9 @@
-{{#unless (or
-  (eq target.currentRouteName 'workspace.projects.project.app.build')
-  (eq target.currentRouteName 'workspace.projects.project.app.deployment')
-  (eq target.currentRouteName 'workspace.projects.project.app.release')
+{{page-title @model.application.application}}
+
+{{#if (and
+  (not-eq this.target.currentRouteName 'workspace.projects.project.app.build')
+  (not-eq this.target.currentRouteName 'workspace.projects.project.app.deployment')
+  (not-eq this.target.currentRouteName 'workspace.projects.project.app.release')
 )}}
 <PageHeader @iconName="git-repository">
   <div class="title">
@@ -53,30 +55,30 @@
 <Pds::TabNav>
   <LinkTo @route="workspace.projects.project.app.logs"
     @models={{array @model.application.project @model.application.application }}>
-    {{inline-svg "page-outline" class="icon"}}
+    <Pds::Icon @type="page-outline" class="icon" />
     {{t "nav.logs"}}
   </LinkTo>
   <LinkTo @route="workspace.projects.project.app.builds"
     @models={{array @model.application.project @model.application.application }}>
-    {{inline-svg "build" class="icon"}}
+    <Pds::Icon @type="build" class="icon" />
     {{t "nav.builds"}}
   </LinkTo>
   <LinkTo @route="workspace.projects.project.app.deployments"
     @models={{array @model.application.project @model.application.application }}>
-    {{inline-svg "upload" class="icon"}}
+    <Pds::Icon @type="upload" class="icon" />
     {{t "nav.deployments"}}
   </LinkTo>
   <LinkTo @route="workspace.projects.project.app.releases"
     @models={{array @model.application.project @model.application.application }}>
-    {{inline-svg "public-default" class="icon"}}
+    <Pds::Icon @type="public-default" class="icon" />
     {{t "nav.releases"}}
   </LinkTo>
   <LinkTo @route="workspace.projects.project.app.exec"
     @models={{array @model.application.project @model.application.application }}>
-    {{inline-svg "exec" class="icon"}}
+    <Pds::Icon @type="exec" class="icon" />
     {{t "nav.exec"}}
   </LinkTo>
 </Pds::TabNav>
-{{/unless}}
+{{/if}}
 
 {{outlet}}

@@ -4,15 +4,16 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/boltdb/bolt"
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/hashicorp/go-memdb"
 	"github.com/mitchellh/go-testing-interface"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -40,6 +41,16 @@ type appOperation struct {
 
 	// Bucket is the global bucket for all records of this operation.
 	Bucket []byte
+
+	// The number of records that should be indexed off disk. This allows
+	// dormant records to remain on disk but not indexed.
+	MaximumIndexedRecords int
+
+	// This guards indexedRecords for manipulation during pruning
+	pruneMu sync.Mutex
+
+	// Holds how many records we've indexed at runtime.
+	indexedRecords int
 
 	// seq is the previous sequence number to set. This is initialized by the
 	// index init on server boot and `sync/atomic` should be used to increment
@@ -87,6 +98,13 @@ func (op *appOperation) register() {
 	dbBuckets = append(dbBuckets, op.Bucket)
 	dbIndexers = append(dbIndexers, op.indexInit)
 	schemas = append(schemas, op.memSchema)
+
+	if op.MaximumIndexedRecords > 0 {
+		pruneFns = append(pruneFns, func(memTxn *memdb.Txn) (string, int, error) {
+			cnt, err := op.pruneOld(memTxn, op.MaximumIndexedRecords)
+			return op.memTableName(), cnt, err
+		})
+	}
 }
 
 // Put inserts or updates an operation record.
@@ -126,6 +144,23 @@ func (op *appOperation) Get(s *State, ref *pb.Ref_Operation) (interface{}, error
 		default:
 			return status.Errorf(codes.FailedPrecondition,
 				"unknown operation reference type: %T", ref.Target)
+		}
+
+		// Check if we are tracking this value in the indexes before returning
+		// it. When pruning, we leave the values on disk but remove them
+		// from the indexes.
+		raw, err := memTxn.First(
+			op.memTableName(),
+			opIdIndexName,
+			id,
+		)
+		if err != nil {
+			return err
+		}
+
+		if raw == nil {
+			return status.Errorf(codes.NotFound,
+				"value with given id not found: %s", id)
 		}
 
 		return op.dbGet(tx, []byte(id), result)
@@ -387,7 +422,7 @@ func (op *appOperation) dbPut(
 		}
 
 		// Next, ensure that the fields we want to match are matched.
-		matchFields := []string{"Sequence"}
+		matchFields := []string{"Generation", "Sequence"}
 		for _, name := range matchFields {
 			f := op.valueFieldReflect(value, name)
 			if !f.IsValid() {
@@ -403,11 +438,52 @@ func (op *appOperation) dbPut(
 		}
 	}
 
-	// If we're not updating, then set the sequence number up if we have one.
 	if !update {
+		// If we're not updating, then set the sequence number up if we have one.
+		var seq uint64
 		if f := op.valueFieldReflect(value, "Sequence"); f.IsValid() {
-			seq := atomic.AddUint64(op.appSeq(appRef), 1)
+			seq = atomic.AddUint64(op.appSeq(appRef), 1)
 			f.Set(reflect.ValueOf(seq))
+		}
+
+		if f := op.valueFieldReflect(value, "Generation"); f.IsValid() {
+			gen := f.Interface().(*pb.Generation)
+
+			// Default the generation to a new ULID if it isn't set.
+			if gen == nil || gen.Id == "" {
+				v, err := ulid()
+				if err != nil {
+					return err
+				}
+
+				gen = &pb.Generation{Id: v}
+				f.Set(reflect.ValueOf(gen))
+			}
+
+			// Our initial sequence is always our current to start. But
+			// if we can find an older version, we will update it.
+			gen.InitialSequence = seq
+
+			// Set our initial sequence number by searching the history
+			// to the first operation that used this generation.
+			iter, err := memTxn.LowerBound(
+				op.memTableName(),
+				opGenIndexName,
+				appRef.Project,
+				appRef.Application,
+				gen.Id,
+				uint64(0),
+			)
+			if err != nil {
+				return err
+			}
+			if raw := iter.Next(); raw != nil {
+				idx := raw.(*operationIndexRecord)
+				if idx.MatchRef(appRef) &&
+					idx.Generation == gen.Id {
+					gen.InitialSequence = idx.Sequence
+				}
+			}
 		}
 	}
 
@@ -469,7 +545,18 @@ func (op *appOperation) appSeq(ref *pb.Ref_Application) *uint64 {
 // persisted on disk.
 func (op *appOperation) indexInit(s *State, dbTxn *bolt.Tx, memTxn *memdb.Txn) error {
 	bucket := dbTxn.Bucket(op.Bucket)
-	return bucket.ForEach(func(k, v []byte) error {
+	c := bucket.Cursor()
+
+	var cnt int
+
+	// This algorithm depends on boltdb's iteration order. Specificly that the keys are
+	// lexically order AND because we're using ULID's for the keys in production, the newest
+	// records will have the higher lexical value and thusly be at the end of the database.
+	//
+	// So we just start at the end and insert records until we hit the maximum, knowing
+	// we'll be inserted the newest records.
+
+	for k, v := c.Last(); k != nil; k, v = c.Prev() {
 		result := op.newStruct()
 		if err := proto.Unmarshal(v, result); err != nil {
 			return err
@@ -489,8 +576,14 @@ func (op *appOperation) indexInit(s *State, dbTxn *bolt.Tx, memTxn *memdb.Txn) e
 			}
 		}
 
-		return nil
-	})
+		cnt++
+
+		if op.MaximumIndexedRecords > 0 && cnt >= op.MaximumIndexedRecords {
+			break
+		}
+	}
+
+	return nil
 }
 
 // indexPut writes an index record for a single operation record.
@@ -530,6 +623,11 @@ func (op *appOperation) indexPut(
 		sequence = v.(uint64)
 	}
 
+	var generation string
+	if v := op.valueField(value, "Generation"); v != nil && v.(*pb.Generation) != nil {
+		generation = v.(*pb.Generation).Id
+	}
+
 	// Get our refs
 	ref := op.valueField(value, "Application").(*pb.Ref_Application)
 	wsRef := op.valueField(value, "Workspace").(*pb.Ref_Workspace)
@@ -540,10 +638,30 @@ func (op *appOperation) indexPut(
 		App:          ref.Application,
 		Workspace:    wsRef.Workspace,
 		Sequence:     sequence,
+		Generation:   generation,
 		StartTime:    startTime,
 		CompleteTime: completeTime,
 	}
+
+	// If there is no maximum, don't track the record count.
+	if op.MaximumIndexedRecords != 0 {
+		op.pruneMu.Lock()
+		op.indexedRecords++
+		op.pruneMu.Unlock()
+	}
+
 	return rec, txn.Insert(op.memTableName(), rec)
+}
+
+func (op *appOperation) pruneOld(memTxn *memdb.Txn, max int) (int, error) {
+	return pruneOld(memTxn, pruneOp{
+		lock:      &op.pruneMu,
+		table:     op.memTableName(),
+		index:     opIdIndexName,
+		indexArgs: []interface{}{""},
+		max:       max,
+		cur:       &op.indexedRecords,
+	})
 }
 
 func (op *appOperation) valueField(value interface{}, field string) interface{} {
@@ -667,6 +785,38 @@ func (op *appOperation) memSchema() *memdb.TableSchema {
 					},
 				},
 			},
+
+			opGenIndexName: {
+				Name:   opGenIndexName,
+				Unique: false,
+
+				// Allow missing since not every app operation has a
+				// generation field.
+				AllowMissing: true,
+
+				Indexer: &memdb.CompoundIndex{
+					Indexes: []memdb.Indexer{
+						&memdb.StringFieldIndex{
+							Field:     "Project",
+							Lowercase: true,
+						},
+
+						&memdb.StringFieldIndex{
+							Field:     "App",
+							Lowercase: true,
+						},
+
+						&memdb.StringFieldIndex{
+							Field:     "Generation",
+							Lowercase: true,
+						},
+
+						&memdb.UintFieldIndex{
+							Field: "Sequence",
+						},
+					},
+				},
+			},
 		},
 	}
 }
@@ -679,6 +829,7 @@ type operationIndexRecord struct {
 	App          string
 	Workspace    string
 	Sequence     uint64
+	Generation   string
 	StartTime    time.Time
 	CompleteTime time.Time
 }
@@ -695,6 +846,7 @@ const (
 	opStartTimeIndexName    = "start-time"    // start time index
 	opCompleteTimeIndexName = "complete-time" // complete time index
 	opSeqIndexName          = "seq"           // sequence number index
+	opGenIndexName          = "generation"    // generation index
 )
 
 // listOperationsOptions are options that can be set for List calls on

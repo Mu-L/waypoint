@@ -234,7 +234,7 @@ func (c *InitCommand) validateServer() bool {
 	defer sg.Wait()
 
 	s := sg.Add("Validating server credentials...")
-	client, err := c.initClient()
+	client, err := c.initClient(nil)
 	if err != nil {
 		c.stepError(s, initStepConnect, err)
 		return false
@@ -566,7 +566,7 @@ func (c *InitCommand) Flags() *flag.Sets {
 			Name:    "from-project",
 			Target:  &c.fromProject,
 			Default: "",
-			Usage: "Create a new application by fetching the given application from" +
+			Usage: "Create a new application by fetching the given application from " +
 				"a remote source or from a local project folder or file on disk.",
 		})
 

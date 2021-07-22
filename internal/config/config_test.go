@@ -52,7 +52,7 @@ func TestLoad_compare(t *testing.T) {
 		t.Run(tt.File, func(t *testing.T) {
 			require := require.New(t)
 
-			cfg, err := Load(filepath.Join("testdata", "compare", tt.File), "")
+			cfg, err := Load(filepath.Join("testdata", "compare", tt.File), nil)
 			if tt.Err != "" {
 				require.Error(err)
 				require.Contains(err.Error(), tt.Err)
@@ -61,6 +61,47 @@ func TestLoad_compare(t *testing.T) {
 			require.NoError(err)
 
 			tt.Func(t, cfg)
+		})
+	}
+}
+
+func TestConfig_variableDecode(t *testing.T) {
+	cases := []struct {
+		file string
+		err  string
+	}{
+		{
+			"valid.hcl",
+			"",
+		},
+		{
+			"invalid_type.hcl",
+			"Invalid type specification",
+		},
+
+		{
+			"invalid_def.hcl",
+			"Invalid default value for variable",
+		},
+		{
+			"duplicate_def.hcl",
+			"Duplicate variable",
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.file, func(t *testing.T) {
+			require := require.New(t)
+
+			_, err := Load(filepath.Join("testdata", "validate", tt.file), nil)
+
+			if tt.err == "" {
+				require.NoError(err)
+				return
+			}
+
+			require.Error(err)
+			require.Contains(err.Error(), tt.err)
 		})
 	}
 }

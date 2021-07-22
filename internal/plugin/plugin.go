@@ -20,9 +20,9 @@ import (
 	"github.com/hashicorp/waypoint/builtin/files"
 	"github.com/hashicorp/waypoint/builtin/google/cloudrun"
 	"github.com/hashicorp/waypoint/builtin/k8s"
-	pluginK8s "github.com/hashicorp/waypoint/builtin/k8s"
-	"github.com/hashicorp/waypoint/builtin/netlify"
+	k8sapply "github.com/hashicorp/waypoint/builtin/k8s/apply"
 	"github.com/hashicorp/waypoint/builtin/nomad"
+	"github.com/hashicorp/waypoint/builtin/nomad/jobspec"
 	"github.com/hashicorp/waypoint/builtin/pack"
 	"github.com/hashicorp/waypoint/builtin/tfc"
 	"github.com/hashicorp/waypoint/builtin/vault"
@@ -41,10 +41,11 @@ var (
 		"google-cloud-run":         cloudrun.Options,
 		"azure-container-instance": aci.Options,
 		"kubernetes":               k8s.Options,
-		"netlify":                  netlify.Options,
+		"kubernetes-apply":         k8sapply.Options,
 		"aws-ecs":                  ecs.Options,
 		"aws-ecr":                  ecr.Options,
 		"nomad":                    nomad.Options,
+		"nomad-jobspec":            jobspec.Options,
 		"aws-ami":                  ami.Options,
 		"aws-ec2":                  ec2.Options,
 		"aws-alb":                  alb.Options,
@@ -64,6 +65,7 @@ var (
 		component.PlatformType:       mustFactory(factory.New(component.TypeMap[component.PlatformType])),
 		component.ReleaseManagerType: mustFactory(factory.New(component.TypeMap[component.ReleaseManagerType])),
 		component.ConfigSourcerType:  mustFactory(factory.New(component.TypeMap[component.ConfigSourcerType])),
+		component.TaskLauncherType:   mustFactory(factory.New(component.TypeMap[component.TaskLauncherType])),
 	}
 
 	// ConfigSourcers are the list of built-in config sourcers. These will
@@ -74,7 +76,7 @@ var (
 			Component: &pluginAWSSSM.ConfigSourcer{},
 		},
 		"kubernetes": {
-			Component: &pluginK8s.ConfigSourcer{},
+			Component: &k8s.ConfigSourcer{},
 		},
 		"vault": {
 			Component: &pluginVault.ConfigSourcer{},

@@ -3,20 +3,32 @@ package nomad
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/golang/protobuf/ptypes"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/api"
 	"github.com/hashicorp/waypoint-plugin-sdk/component"
 	"github.com/hashicorp/waypoint-plugin-sdk/docs"
 	"github.com/hashicorp/waypoint-plugin-sdk/terminal"
 	"github.com/hashicorp/waypoint/builtin/docker"
+
+	sdk "github.com/hashicorp/waypoint-plugin-sdk/proto/gen"
 )
 
 const (
 	metaId    = "waypoint.hashicorp.com/id"
 	metaNonce = "waypoint.hashicorp.com/nonce"
+)
+
+var (
+	// default resources used for the deployed app. Can be overridden
+	// through the resources stanza in a deploy. Note that these are the same defaults
+	// used currently in Nomad if left unconfigured.
+	defaultResourcesCPU      = 100
+	defaultResourcesMemoryMB = 300
 )
 
 // Platform is the Platform implementation for Nomad.
@@ -55,6 +67,11 @@ func (p *Platform) Auth() error {
 
 func (p *Platform) ValidateAuth() error {
 	return nil
+}
+
+// StatusFunc implements component.Status
+func (p *Platform) StatusFunc() interface{} {
+	return p.Status
 }
 
 // Deploy deploys an image to Nomad.
@@ -111,11 +128,25 @@ func (p *Platform) Deploy(
 				},
 			},
 		}
+
+		if p.config.Namespace == "" {
+			p.config.Namespace = "default"
+		}
+		job.Namespace = &p.config.Namespace
 		job.AddTaskGroup(tg)
-		tg.AddTask(&api.Task{
+		task := &api.Task{
 			Name:   result.Name,
 			Driver: "docker",
-		})
+		}
+
+		if p.config.Resources != nil {
+			task.Resources = &api.Resources{
+				CPU:      p.config.Resources.CPU,
+				MemoryMB: p.config.Resources.MemoryMB,
+			}
+		}
+
+		tg.AddTask(task)
 		err = nil
 	}
 	if err != nil {
@@ -174,7 +205,7 @@ func (p *Platform) Deploy(
 	// Wait on the allocation
 	st.Update(fmt.Sprintf("Monitoring evaluation %q", evalID))
 
-	if err := newMonitor(st, client).monitor(evalID); err != nil {
+	if err := NewMonitor(st, client).Monitor(evalID); err != nil {
 		return nil, err
 	}
 	st.Step(terminal.StatusOK, "Deployment successfully rolled out!")
@@ -203,6 +234,81 @@ func (p *Platform) Destroy(
 	return err
 }
 
+func (p *Platform) Status(
+	ctx context.Context,
+	log hclog.Logger,
+	deployment *Deployment,
+	ui terminal.UI,
+) (*sdk.StatusReport, error) {
+	client, err := api.NewClient(api.DefaultConfig())
+	if err != nil {
+		return nil, err
+	}
+	jobclient := client.Jobs()
+
+	sg := ui.StepGroup()
+	defer sg.Wait()
+
+	s := sg.Add("Gathering health report for Nomad platform...")
+	defer func() { s.Abort() }()
+
+	// Create our status report
+	var result sdk.StatusReport
+	result.External = true
+
+	log.Debug("querying nomad for job health")
+
+	job, _, err := jobclient.Info(deployment.Name, &api.QueryOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if *job.Status == "running" {
+		result.Health = sdk.StatusReport_READY
+		result.HealthMessage = fmt.Sprintf("Job %q is reporting ready!", deployment.Name)
+	} else if *job.Status == "queued" || *job.Status == "started" {
+		result.Health = sdk.StatusReport_ALIVE
+		result.HealthMessage = fmt.Sprintf("Job %q is reporting alive!", deployment.Name)
+	} else if *job.Status == "completed" {
+		result.Health = sdk.StatusReport_PARTIAL
+		result.HealthMessage = fmt.Sprintf("Job %q is reporting partially available!", deployment.Name)
+	} else if *job.Status == "failed" || *job.Status == "lost" {
+		result.Health = sdk.StatusReport_DOWN
+		result.HealthMessage = fmt.Sprintf("Job %q is reporting down!", deployment.Name)
+	} else {
+		result.Health = sdk.StatusReport_UNKNOWN
+		result.HealthMessage = fmt.Sprintf("Job %q is reporting unknown!", deployment.Name)
+	}
+
+	result.HealthMessage = *job.StatusDescription
+
+	result.GeneratedTime = ptypes.TimestampNow()
+
+	s.Update("Finished building report for Nomad platform")
+	s.Done()
+
+	// NOTE(briancain): Replace ui.Status with StepGroups once this bug
+	// has been fixed: https://github.com/hashicorp/waypoint/issues/1536
+	st := ui.Status()
+	defer st.Close()
+
+	st.Update("Determining overall container health...")
+	if result.Health == sdk.StatusReport_READY {
+		st.Step(terminal.StatusOK, result.HealthMessage)
+	} else {
+		if result.Health == sdk.StatusReport_PARTIAL {
+			st.Step(terminal.StatusWarn, result.HealthMessage)
+		} else {
+			st.Step(terminal.StatusError, result.HealthMessage)
+		}
+
+		// Extra advisory wording to let user know that the deployment could be still starting up
+		// if the report was generated immediately after it was deployed or released.
+		st.Step(terminal.StatusWarn, mixedHealthWarn)
+	}
+
+	return &result, nil
+}
+
 // Config is the configuration structure for the Platform.
 type Config struct {
 	// The credential of docker registry.
@@ -221,6 +327,10 @@ type Config struct {
 	// The Nomad region to deploy to, defaults to "global"
 	Region string `hcl:"region,optional"`
 
+	// The amount of resources to allocate to the Nomad task for the deployed
+	// application
+	Resources *Resources `hcl:"resources,block"`
+
 	// Port that your service is running on within the actual container.
 	// Defaults to port 3000.
 	// TODO Evaluate if this should remain as a default 3000, should be a required field,
@@ -232,6 +342,11 @@ type Config struct {
 	// selected via environment variable. Most configuration should use the waypoint
 	// config commands.
 	StaticEnvVars map[string]string `hcl:"static_environment,optional"`
+}
+
+type Resources struct {
+	CPU      *int `hcl:"cpu,optional"`
+	MemoryMB *int `hcl:"memorymb,optional"`
 }
 
 // AuthConfig maps the the Nomad Docker driver 'auth' config block
@@ -255,7 +370,7 @@ deploy {
         use "nomad" {
           region = "global"
           datacenter = "dc1"
-          auth = {
+          auth {
             username = "username"
             password = "password"
           }
@@ -293,6 +408,24 @@ deploy {
 	)
 
 	doc.SetField(
+		"resources",
+		"The amount of resources to allocate to the deployed allocation.",
+		docs.SubFields(func(doc *docs.SubFieldDoc) {
+			doc.SetField(
+				"cpu",
+				"Amount of CPU in MHz to allocate to this task",
+				docs.Default(strconv.Itoa(defaultResourcesCPU)),
+			)
+
+			doc.SetField(
+				"memorymb",
+				"Amount of memory in MB to allocate to this task.",
+				docs.Default(strconv.Itoa(defaultResourcesMemoryMB)),
+			)
+		}),
+	)
+
+	doc.SetField(
 		"auth",
 		"The credentials for docker registry.",
 	)
@@ -309,6 +442,13 @@ deploy {
 
 	return doc, nil
 }
+
+var (
+	mixedHealthWarn = strings.TrimSpace(`
+Waypoint detected that the current deployment is not ready, however your application
+might be available or still starting up.
+`)
+)
 
 var (
 	_ component.Platform     = (*Platform)(nil)

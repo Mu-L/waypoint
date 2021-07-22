@@ -442,7 +442,7 @@ func (i *K8sInstaller) Upgrade(
 
 		log.Info("Pod(s) deleted, k8s will now restart waypoint server ", serverName)
 	} else if waypointStatefulSet.Spec.UpdateStrategy.Type == "RollingUpdate" {
-		log.Info("Update Strategy is 'RollingUpdate', no further action required")
+		log.Info("Update Strategy is 'RollingUpdate'; once the upgrade completes, you may need to restart the pod to update the server image")
 	} else {
 		log.Warn("Update Strategy is not recognized, so no action is taken", "UpdateStrategy",
 			waypointStatefulSet.Spec.UpdateStrategy.Type)
@@ -561,8 +561,14 @@ func (i *K8sInstaller) Upgrade(
 	}
 
 	if waypointStatefulSet.Spec.UpdateStrategy.Type == "RollingUpdate" {
-		ui.Output("\nKubernetes is now set to upgrade waypoint server image with its\n" +
-			"'RollingUpdate' strategy. This means the pod might not be updated immediately.")
+		ui.Output("\nKubernetes is now set to upgrade waypoint server image with its\n"+
+			"'RollingUpdate' strategy. This means the pod might not be updated immediately.",
+			terminal.WithWarningStyle(),
+		)
+		s.Update("Update Strategy is 'RollingUpdate'; once the upgrade completes, you may need to restart the pod to update the server image")
+		s.Status(terminal.StatusWarn)
+		s.Done()
+		s = sg.Add("")
 	}
 	s.Update("Upgrade complete!")
 	s.Done()
@@ -1409,6 +1415,13 @@ func (i *K8sInstaller) UninstallFlags(set *flag.Set) {
 			" unset, Waypoint will use the current Kubernetes context.",
 		Default: "",
 	})
+
+	set.StringVar(&flag.StringVar{
+		Name:    "k8s-namespace",
+		Target:  &i.config.namespace,
+		Usage:   "Namespace in Kubernetes to uninstall the Waypoint server from.",
+		Default: "",
+	})
 }
 
 func int32Ptr(i int32) *int32 {
@@ -1467,8 +1480,7 @@ func (i *K8sInstaller) newClient() (*kubernetes.Clientset, error) {
 	return clientset, nil
 }
 
-var (
-	warnK8SKind = strings.TrimSpace(`
+var warnK8SKind = strings.TrimSpace(`
 Kind cluster detected!
 
 Installing Waypoint to a Kind cluster requires that the cluster has
@@ -1476,4 +1488,3 @@ LoadBalancer capabilities (such as metallb). If Kind isn't configured
 in this way, then the install may hang. If this happens, please delete
 all the Waypoint resources and try again.
 `)
-)

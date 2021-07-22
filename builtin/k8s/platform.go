@@ -7,11 +7,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/golang/protobuf/ptypes"
 	"github.com/hashicorp/go-hclog"
 	"github.com/mitchellh/mapstructure"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
+	k8sresource "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -19,8 +20,11 @@ import (
 
 	"github.com/hashicorp/waypoint-plugin-sdk/component"
 	"github.com/hashicorp/waypoint-plugin-sdk/docs"
+	"github.com/hashicorp/waypoint-plugin-sdk/framework/resource"
+	sdk "github.com/hashicorp/waypoint-plugin-sdk/proto/gen"
 	"github.com/hashicorp/waypoint-plugin-sdk/terminal"
 	"github.com/hashicorp/waypoint/builtin/docker"
+	"github.com/hashicorp/waypoint/internal/clierrors"
 )
 
 const (
@@ -69,6 +73,10 @@ func (p *Platform) ValidateAuth() error {
 	return nil
 }
 
+func (p *Platform) StatusFunc() interface{} {
+	return p.Status
+}
+
 // DefaultReleaserFunc implements component.PlatformReleaser
 func (p *Platform) DefaultReleaserFunc() interface{} {
 	var rc ReleaserConfig
@@ -84,58 +92,79 @@ func (p *Platform) DefaultReleaserFunc() interface{} {
 	}
 }
 
-// Deploy deploys an image to Kubernetes.
-func (p *Platform) Deploy(
+func (p *Platform) resourceManager(log hclog.Logger) *resource.Manager {
+	return resource.NewManager(
+		resource.WithLogger(log.Named("resource_manager")),
+		resource.WithValueProvider(p.getClientset),
+		resource.WithResource(resource.NewResource(
+			resource.WithName("deployment"),
+			resource.WithState(&Resource_Deployment{}),
+			resource.WithCreate(p.resourceDeploymentCreate),
+			resource.WithDestroy(p.resourceDeploymentDestroy),
+		)),
+	)
+	return nil
+}
+
+// getClientset is a value provider for our resource manager and provides
+// the connection information used by resources to interact with Kubernetes.
+func (p *Platform) getClientset() (*clientsetInfo, error) {
+	// Get our client
+	clientSet, ns, config, err := clientset(p.config.KubeconfigPath, p.config.Context)
+	if err != nil {
+		return nil, err
+	}
+
+	return &clientsetInfo{
+		Clientset: clientSet,
+		Namespace: ns,
+		Config:    config,
+	}, nil
+}
+
+// resourceDeploymentCreate creates the Kubernetes deployment.
+func (p *Platform) resourceDeploymentCreate(
 	ctx context.Context,
 	log hclog.Logger,
 	src *component.Source,
 	img *docker.Image,
 	deployConfig *component.DeploymentConfig,
 	ui terminal.UI,
-) (*Deployment, error) {
-	// Create our deployment and set an initial ID
-	var result Deployment
-	id, err := component.Id()
-	if err != nil {
-		return nil, err
-	}
-	result.Id = id
-	result.Name = strings.ToLower(fmt.Sprintf("%s-%s", src.App, id))
 
-	sg := ui.StepGroup()
-	step := sg.Add("Initializing Kubernetes client...")
-	defer step.Abort()
-
-	// Get our client
-	clientset, ns, config, err := clientset(p.config.KubeconfigPath, p.config.Context)
-	if err != nil {
-		return nil, err
-	}
-
-	// Override namespace if set
+	result *Deployment,
+	state *Resource_Deployment,
+	csinfo *clientsetInfo,
+	sg terminal.StepGroup,
+) error {
+	// Prepare our namespace and override if set.
+	ns := csinfo.Namespace
 	if p.config.Namespace != "" {
 		ns = p.config.Namespace
 	}
 
-	step.Update("Kubernetes client connected to %s with namespace %s", config.Host, ns)
+	step := sg.Add("")
+	defer func() { step.Abort() }()
+	step.Update("Kubernetes client connected to %s with namespace %s", csinfo.Config.Host, ns)
 	step.Done()
 
 	step = sg.Add("Preparing deployment...")
 
-	deployclient := clientset.AppsV1().Deployments(ns)
+	clientSet := csinfo.Clientset
+	deployClient := clientSet.AppsV1().Deployments(ns)
 
 	// Determine if we have a deployment that we manage already
 	create := false
-	deployment, err := deployclient.Get(ctx, result.Name, metav1.GetOptions{})
+	deployment, err := deployClient.Get(ctx, result.Name, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
 		deployment = result.newDeployment(result.Name)
 		create = true
 		err = nil
 	}
 	if err != nil {
-		return nil, err
+		return err
 	}
 
+	// Setup our port configuration
 	if p.config.ServicePort == 0 && p.config.Ports == nil {
 		// nothing defined, set up the defaults
 		p.config.Ports = make([]map[string]string, 1)
@@ -146,7 +175,7 @@ func (p *Platform) Deploy(
 		p.config.Ports[0] = map[string]string{"port": strconv.Itoa(int(p.config.ServicePort)), "name": "http"}
 	} else if p.config.ServicePort > 0 && len(p.config.Ports) > 0 {
 		// both defined, this is an error
-		return nil, fmt.Errorf("Cannot define both 'service_port' and 'ports'. Use" +
+		return fmt.Errorf("Cannot define both 'service_port' and 'ports'. Use" +
 			" 'ports' for configuring multiple container ports.")
 	}
 
@@ -157,14 +186,12 @@ func (p *Platform) Deploy(
 			Value: fmt.Sprint(p.config.Ports[0]["port"]),
 		},
 	}
-
 	for k, v := range p.config.StaticEnvVars {
 		env = append(env, corev1.EnvVar{
 			Name:  k,
 			Value: v,
 		})
 	}
-
 	for k, v := range deployConfig.Env() {
 		env = append(env, corev1.EnvVar{
 			Name:  k,
@@ -182,6 +209,7 @@ func (p *Platform) Deploy(
 	// Set our ID on the label. We use this ID so that we can have a key
 	// to route to multiple versions during release management.
 	deployment.Spec.Template.Labels[labelId] = result.Id
+
 	// Version label duplicates "labelId" to support services like Istio that
 	// expect pods to be labled with 'version'
 	deployment.Spec.Template.Labels["version"] = result.Id
@@ -199,26 +227,26 @@ func (p *Platform) Deploy(
 	}
 
 	// Get container resource limits and requests
-	var resourceLimits = make(map[corev1.ResourceName]resource.Quantity)
-	var resourceRequests = make(map[corev1.ResourceName]resource.Quantity)
+	var resourceLimits = make(map[corev1.ResourceName]k8sresource.Quantity)
+	var resourceRequests = make(map[corev1.ResourceName]k8sresource.Quantity)
 
 	for k, v := range p.config.Resources {
 		if strings.HasPrefix(k, "limits_") {
 			limitKey := strings.Split(k, "_")
 			resourceName := corev1.ResourceName(limitKey[1])
 
-			quantity, err := resource.ParseQuantity(v)
+			quantity, err := k8sresource.ParseQuantity(v)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			resourceLimits[resourceName] = quantity
 		} else if strings.HasPrefix(k, "requests_") {
 			reqKey := strings.Split(k, "_")
 			resourceName := corev1.ResourceName(reqKey[1])
 
-			quantity, err := resource.ParseQuantity(v)
+			quantity, err := k8sresource.ParseQuantity(v)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			resourceRequests[resourceName] = quantity
 		} else {
@@ -248,37 +276,63 @@ func (p *Platform) Deploy(
 	// assume the first port defined is the 'main' port to use
 	defaultPort := int(containerPorts[0].ContainerPort)
 
+	initialDelaySeconds := int32(5)
+	timeoutSeconds := int32(5)
+	failureThreshold := int32(5)
+	if p.config.Probe != nil {
+		if p.config.Probe.InitialDelaySeconds != 0 {
+			initialDelaySeconds = int32(p.config.Probe.InitialDelaySeconds)
+		}
+		if p.config.Probe.TimeoutSeconds != 0 {
+			timeoutSeconds = int32(p.config.Probe.TimeoutSeconds)
+		}
+		if p.config.Probe.FailureThreshold != 0 {
+			failureThreshold = int32(p.config.Probe.FailureThreshold)
+		}
+	}
+
+	container := corev1.Container{
+		Name:            result.Name,
+		Image:           img.Name(),
+		ImagePullPolicy: pullPolicy,
+		Ports:           containerPorts,
+		LivenessProbe: &corev1.Probe{
+			Handler: corev1.Handler{
+				TCPSocket: &corev1.TCPSocketAction{
+					Port: intstr.FromInt(defaultPort),
+				},
+			},
+			InitialDelaySeconds: initialDelaySeconds,
+			TimeoutSeconds:      timeoutSeconds,
+			FailureThreshold:    failureThreshold,
+		},
+		ReadinessProbe: &corev1.Probe{
+			Handler: corev1.Handler{
+				TCPSocket: &corev1.TCPSocketAction{
+					Port: intstr.FromInt(defaultPort),
+				},
+			},
+			InitialDelaySeconds: initialDelaySeconds,
+			TimeoutSeconds:      timeoutSeconds,
+		},
+		Env:       env,
+		Resources: resourceRequirements,
+	}
+
+	if p.config.Pod != nil && p.config.Pod.Container != nil {
+		containerCfg := p.config.Pod.Container
+		if containerCfg.Command != nil {
+			container.Command = *containerCfg.Command
+		}
+
+		if containerCfg.Args != nil {
+			container.Args = *containerCfg.Args
+		}
+	}
+
 	// Update the deployment with our spec
 	deployment.Spec.Template.Spec = corev1.PodSpec{
-		Containers: []corev1.Container{
-			{
-				Name:            result.Name,
-				Image:           img.Name(),
-				ImagePullPolicy: pullPolicy,
-				Ports:           containerPorts,
-				LivenessProbe: &corev1.Probe{
-					Handler: corev1.Handler{
-						TCPSocket: &corev1.TCPSocketAction{
-							Port: intstr.FromInt(defaultPort),
-						},
-					},
-					InitialDelaySeconds: 5,
-					TimeoutSeconds:      5,
-					FailureThreshold:    5,
-				},
-				ReadinessProbe: &corev1.Probe{
-					Handler: corev1.Handler{
-						TCPSocket: &corev1.TCPSocketAction{
-							Port: intstr.FromInt(defaultPort),
-						},
-					},
-					InitialDelaySeconds: 5,
-					TimeoutSeconds:      5,
-				},
-				Env:       env,
-				Resources: resourceRequirements,
-			},
-		},
+		Containers: []corev1.Container{container},
 	}
 
 	// Override the default TCP socket checks if we have a probe path
@@ -290,9 +344,9 @@ func (p *Platform) Deploy(
 					Port: intstr.FromInt(defaultPort),
 				},
 			},
-			InitialDelaySeconds: 5,
-			TimeoutSeconds:      5,
-			FailureThreshold:    5,
+			InitialDelaySeconds: initialDelaySeconds,
+			TimeoutSeconds:      timeoutSeconds,
+			FailureThreshold:    failureThreshold,
 		}
 
 		deployment.Spec.Template.Spec.Containers[0].ReadinessProbe = &corev1.Probe{
@@ -302,26 +356,45 @@ func (p *Platform) Deploy(
 					Port: intstr.FromInt(defaultPort),
 				},
 			},
-			InitialDelaySeconds: 5,
-			TimeoutSeconds:      5,
+			InitialDelaySeconds: initialDelaySeconds,
+			TimeoutSeconds:      timeoutSeconds,
 		}
 	}
 
-	if p.config.ScratchSpace != "" {
-		deployment.Spec.Template.Spec.Volumes = []corev1.Volume{
-			{
-				Name: "scratch",
-				VolumeSource: corev1.VolumeSource{
-					EmptyDir: &corev1.EmptyDirVolumeSource{},
+	if len(p.config.ScratchSpace) > 0 {
+		for idx, scratchSpaceLocation := range p.config.ScratchSpace {
+			scratchName := fmt.Sprintf("scratch-%d", idx)
+			deployment.Spec.Template.Spec.Volumes = append(
+				deployment.Spec.Template.Spec.Volumes,
+				corev1.Volume{
+					Name: scratchName,
+					VolumeSource: corev1.VolumeSource{
+						EmptyDir: &corev1.EmptyDirVolumeSource{},
+					},
 				},
-			},
-		}
+			)
 
-		deployment.Spec.Template.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{
-			{
-				Name:      "scratch",
-				MountPath: p.config.ScratchSpace,
-			},
+			deployment.Spec.Template.Spec.Containers[0].VolumeMounts = append(
+				deployment.Spec.Template.Spec.Containers[0].VolumeMounts,
+				corev1.VolumeMount{
+					Name:      scratchName,
+					MountPath: scratchSpaceLocation,
+				},
+			)
+		}
+	}
+
+	if p.config.Pod != nil {
+		// Configure Pod
+		podConfig := p.config.Pod
+		if podConfig.SecurityContext != nil {
+			secCtx := podConfig.SecurityContext
+			// Configure Pod Security Context
+			deployment.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{
+				RunAsUser:    secCtx.RunAsUser,
+				RunAsNonRoot: secCtx.RunAsNonRoot,
+				FSGroup:      secCtx.FsGroup,
+			}
 		}
 	}
 
@@ -350,7 +423,7 @@ func (p *Platform) Deploy(
 		deployment.Spec.Template.Spec.ServiceAccountName = p.config.ServiceAccount
 
 		// Determine if we need to make a service account
-		saClient := clientset.CoreV1().ServiceAccounts(ns)
+		saClient := clientSet.CoreV1().ServiceAccounts(ns)
 		saCreate := false
 		serviceAccount, err := saClient.Get(ctx, p.config.ServiceAccount, metav1.GetOptions{})
 		if errors.IsNotFound(err) {
@@ -359,18 +432,18 @@ func (p *Platform) Deploy(
 			err = nil
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		if saCreate {
 			serviceAccount, err = saClient.Create(ctx, serviceAccount, metav1.CreateOptions{})
 			if err != nil {
-				return nil, err
+				return err
 			}
 		}
 	}
 
-	dc := clientset.AppsV1().Deployments(ns)
+	dc := clientSet.AppsV1().Deployments(ns)
 
 	// Create/update
 	if create {
@@ -383,13 +456,17 @@ func (p *Platform) Deploy(
 		deployment, err = dc.Update(ctx, deployment, metav1.UpdateOptions{})
 	}
 	if err != nil {
-		return nil, err
+		return err
 	}
+
+	// We successfully created or updated, so set the name on our state so
+	// that if we error, we'll partially clean up properly. THIS IS IMPORTANT.
+	state.Name = result.Name
 
 	step.Done()
 	step = sg.Add("Waiting for deployment...")
 
-	ps := clientset.CoreV1().Pods(ns)
+	ps := clientSet.CoreV1().Pods(ns)
 	podLabelId := fmt.Sprintf("%s=%s", labelId, result.Id)
 
 	var (
@@ -464,11 +541,76 @@ func (p *Platform) Deploy(
 		if err == wait.ErrWaitTimeout {
 			err = fmt.Errorf("Deployment was not able to start pods after %s", timeout)
 		}
-		return nil, err
+		return err
 	}
 
 	step.Update("Deployment successfully rolled out!")
 	step.Done()
+
+	return nil
+}
+
+// Destroy deletes the K8S deployment.
+func (p *Platform) resourceDeploymentDestroy(
+	ctx context.Context,
+	state *Resource_Deployment,
+	sg terminal.StepGroup,
+	csinfo *clientsetInfo,
+) error {
+	// Prepare our namespace and override if set.
+	ns := csinfo.Namespace
+	if p.config.Namespace != "" {
+		ns = p.config.Namespace
+	}
+
+	step := sg.Add("")
+	defer func() { step.Abort() }()
+	step.Update("Kubernetes client connected to %s with namespace %s", csinfo.Config.Host, ns)
+	step.Done()
+
+	step = sg.Add("Deleting deployment...")
+	deployclient := csinfo.Clientset.AppsV1().Deployments(ns)
+	if err := deployclient.Delete(ctx, state.Name, metav1.DeleteOptions{}); err != nil {
+		return err
+	}
+	step.Done()
+
+	return nil
+}
+
+// Deploy deploys an image to Kubernetes.
+func (p *Platform) Deploy(
+	ctx context.Context,
+	log hclog.Logger,
+	src *component.Source,
+	img *docker.Image,
+	deployConfig *component.DeploymentConfig,
+	ui terminal.UI,
+) (*Deployment, error) {
+	// Create our deployment and set an initial ID
+	var result Deployment
+	id, err := component.Id()
+	if err != nil {
+		return nil, err
+	}
+	result.Id = id
+	result.Name = strings.ToLower(fmt.Sprintf("%s-%s", src.App, id))
+
+	// We'll update the user in real time
+	sg := ui.StepGroup()
+	defer sg.Wait()
+
+	// Create our resource manager and create
+	rm := p.resourceManager(log)
+	if err := rm.CreateAll(
+		ctx, log, sg, ui,
+		src, img, deployConfig, &result,
+	); err != nil {
+		return nil, err
+	}
+
+	// Store our resource state
+	result.ResourceState = rm.State()
 
 	return &result, nil
 }
@@ -481,31 +623,99 @@ func (p *Platform) Destroy(
 	ui terminal.UI,
 ) error {
 	sg := ui.StepGroup()
-	step := sg.Add("Initializing Kubernetes client...")
-	defer step.Abort()
+	defer sg.Wait()
 
-	// Get our client
-	clientset, ns, config, err := clientset(p.config.KubeconfigPath, p.config.Context)
+	rm := p.resourceManager(log)
+
+	// If we don't have resource state, this state is from an older version
+	// and we need to manually recreate it.
+	if deployment.ResourceState == nil {
+		rm.Resource("deployment").SetState(&Resource_Deployment{
+			Name: deployment.Name,
+		})
+	} else {
+		// Load our set state
+		if err := rm.LoadState(deployment.ResourceState); err != nil {
+			return err
+		}
+	}
+
+	// Destroy
+	return rm.DestroyAll(ctx, log, sg, ui)
+}
+
+func (p *Platform) Status(
+	ctx context.Context,
+	log hclog.Logger,
+	deployment *Deployment,
+	ui terminal.UI,
+) (*sdk.StatusReport, error) {
+	sg := ui.StepGroup()
+	defer sg.Wait()
+
+	step := sg.Add("Gathering health report for Kubernetes platform...")
+	defer func() { step.Abort() }() // Defer in func in case more steps are added to this func in the future
+
+	csInfo, err := p.getClientset()
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	// Override namespace if set
+	clientSet := csInfo.Clientset
+	namespace := csInfo.Namespace
 	if p.config.Namespace != "" {
-		ns = p.config.Namespace
+		namespace = p.config.Namespace
 	}
 
-	step.Update("Kubernetes client connected to %s with namespace %s", config.Host, ns)
-	step.Done()
-	step = sg.Add("Deleting deployment...")
-
-	deployclient := clientset.AppsV1().Deployments(ns)
-	if err := deployclient.Delete(ctx, deployment.Name, metav1.DeleteOptions{}); err != nil {
-		return err
+	podClient := clientSet.CoreV1().Pods(namespace)
+	podLabelId := fmt.Sprintf("app=%s", deployment.Name)
+	podList, err := podClient.List(ctx, metav1.ListOptions{LabelSelector: podLabelId})
+	if err != nil {
+		ui.Output(
+			"Error listing pods to determine application health: %s", clierrors.Humanize(err),
+			terminal.WithErrorStyle(),
+		)
+		return nil, err
 	}
 
+	// Create our status report
+	step.Update("Building status report for running pods...")
+	result := buildStatusReport(podList)
+
+	result.GeneratedTime = ptypes.TimestampNow()
+	log.Debug("status report complete")
+
+	// update output based on main health state
+	step.Update("Finished building report for Kubernetes platform")
 	step.Done()
-	return nil
+
+	// NOTE(briancain): Replace ui.Status with StepGroups once this bug
+	// has been fixed: https://github.com/hashicorp/waypoint/issues/1536
+	st := ui.Status()
+	defer st.Close()
+
+	st.Update("Determining overall container health...")
+	if result.Health == sdk.StatusReport_READY {
+		st.Step(terminal.StatusOK, fmt.Sprintf("Deployment %q is reporting ready!", deployment.Name))
+	} else {
+		if result.Health == sdk.StatusReport_PARTIAL {
+			st.Step(terminal.StatusWarn, fmt.Sprintf("Deployment %q is reporting partially available!", deployment.Name))
+		} else {
+			st.Step(terminal.StatusError, fmt.Sprintf("Deployment %q is reporting not ready!", deployment.Name))
+		}
+
+		// Extra advisory wording to let user know that the deployment could be still starting up
+		// if the report was generated immediately after it was deployed or released.
+		st.Step(terminal.StatusWarn, mixedHealthWarn)
+	}
+
+	// More UI detail for non-ready resources
+	for _, resource := range result.Resources {
+		if resource.Health != sdk.StatusReport_READY {
+			st.Step(terminal.StatusWarn, fmt.Sprintf("Resource %q is reporting %q", resource.Name, resource.Health.String()))
+		}
+	}
+
+	return &result, nil
 }
 
 // Config is the configuration structure for the Platform.
@@ -547,13 +757,16 @@ type Config struct {
 	// made to the port.
 	ProbePath string `hcl:"probe_path,optional"`
 
+	// Probe details for describing a health check to be performed against a container.
+	Probe *Probe `hcl:"probe,block"`
+
 	// Optionally define various resources limits for kubernetes pod containers
 	// such as memory and cpu.
 	Resources map[string]string `hcl:"resources,optional"`
 
-	// A path to a directory that will be created for the service to store
-	// temporary data.
-	ScratchSpace string `hcl:"scratch_path,optional"`
+	// An array of paths to directories that will be mounted as EmptyDirVolumes in the pod
+	// to store temporary data.
+	ScratchSpace []string `hcl:"scratch_path,optional"`
 
 	// ServiceAccount is the name of the Kubernetes service account to apply to the
 	// application deployment. This is useful to apply Kubernetes RBAC to the pod.
@@ -569,6 +782,45 @@ type Config struct {
 	// selected via environment variable. Most configuration should use the waypoint
 	// config commands.
 	StaticEnvVars map[string]string `hcl:"static_environment,optional"`
+
+	// Pod describes the configuration for the pod
+	Pod *Pod `hcl:"pod,block"`
+}
+
+// Pod describes the configuration for the pod
+type Pod struct {
+	SecurityContext *PodSecurityContext `hcl:"security_context,block"`
+	Container       *Container          `hcl:"container,block"`
+}
+
+// Container describes the commands and arguments for a container config
+type Container struct {
+	Command *[]string `hcl:"command"`
+	Args    *[]string `hcl:"args"`
+}
+
+// PodSecurityContext describes the security config for the Pod
+type PodSecurityContext struct {
+	RunAsUser    *int64 `hcl:"run_as_user"`
+	RunAsNonRoot *bool  `hcl:"run_as_non_root"`
+	FsGroup      *int64 `hcl:"fs_group"`
+}
+
+// Probe describes a health check to be performed against a container to determine whether it is
+// alive or ready to receive traffic.
+type Probe struct {
+	// Time in seconds to wait before performing the initial liveness and readiness probes.
+	// Defaults to 5 seconds.
+	InitialDelaySeconds uint `hcl:"initial_delay,optional"`
+
+	// Time in seconds before the probe fails.
+	// Defaults to 5 seconds.
+	TimeoutSeconds uint `hcl:"timeout,optional"`
+
+	// Number of times a liveness probe can fail before the container is killed.
+	// FailureThreshold * TimeoutSeconds should be long enough to cover your worst
+	// case startup times. Defaults to 5 failures.
+	FailureThreshold uint `hcl:"failure_threshold,optional"`
 }
 
 func (p *Platform) Documentation() (*docs.Documentation, error) {
@@ -586,6 +838,47 @@ deploy "kubernetes" {
 	probe_path = "/_healthz"
 }
 `)
+
+	doc.SetField(
+		"pod",
+		"the configuration for a pod",
+		docs.Summary("Pod describes the configuration for a pod when deploying"),
+		docs.SubFields(func(doc *docs.SubFieldDoc) {
+			doc.SetField(
+				"container",
+				"container describes the commands and arguments for a container config",
+				docs.SubFields(func(doc *docs.SubFieldDoc) {
+					doc.SetField(
+						"command",
+						"An array of strings to run for the container",
+					)
+
+					doc.SetField(
+						"args",
+						"An array of string arguments to pass through to the container",
+					)
+				}),
+			)
+			doc.SetField(
+				"pod_security_context",
+				"holds pod-level security attributes and container settings",
+				docs.SubFields(func(doc *docs.SubFieldDoc) {
+					doc.SetField(
+						"run_as_user",
+						"The UID to run the entrypoint of the container process",
+					)
+					doc.SetField(
+						"run_as_non_root",
+						"Indicates that the container must run as a non-root user",
+					)
+					doc.SetField(
+						"fs_group",
+						"A special supplemental group that applies to all containers in a pod",
+					)
+				}),
+			)
+		}),
+	)
 
 	doc.SetField(
 		"kubeconfig",
@@ -613,7 +906,7 @@ deploy "kubernetes" {
 		"a map of resource limits and requests to apply to a pod on deploy",
 		docs.Summary(
 			"resource limits and requests for a pod. limits and requests options "+
-				"must start with either 'limits_' or 'requests_'. Any other options "+
+				"must start with either 'limits\\_' or 'requests\\_'. Any other options "+
 				"will be ignored.",
 		),
 	)
@@ -634,6 +927,36 @@ deploy "kubernetes" {
 		docs.Summary(
 			"without this, the test will simply be that the application has bound to the port",
 		),
+	)
+
+	doc.SetField(
+		"probe",
+		"configuration to control liveness and readiness probes",
+		docs.Summary("Probe describes a health check to be performed against a ",
+			"container to determine whether it is alive or ready to receive traffic."),
+		docs.SubFields(func(doc *docs.SubFieldDoc) {
+			doc.SetField(
+				"initial_delay",
+				"time in seconds to wait before performing the initial liveness and readiness probes",
+				docs.Default("5"),
+			)
+
+			doc.SetField(
+				"timeout",
+				"time in seconds before the probe fails",
+				docs.Default("5"),
+			)
+
+			doc.SetField(
+				"failure_threshold",
+				"number of times a liveness probe can fail before the container is killed",
+				docs.Summary(
+					"failureThreshold * TimeoutSeconds should be long enough to cover your worst case startup times",
+				),
+				docs.Default("5"),
+			)
+
+		}),
 	)
 
 	doc.SetField(
@@ -710,9 +1033,17 @@ deploy "kubernetes" {
 }
 
 var (
+	mixedHealthWarn = strings.TrimSpace(`
+Waypoint detected that the current deployment is not ready, however your application
+might be available or still starting up.
+`)
+)
+
+var (
 	_ component.Platform         = (*Platform)(nil)
 	_ component.PlatformReleaser = (*Platform)(nil)
 	_ component.Configurable     = (*Platform)(nil)
 	_ component.Documented       = (*Platform)(nil)
 	_ component.Destroyer        = (*Platform)(nil)
+	_ component.Status           = (*Platform)(nil)
 )

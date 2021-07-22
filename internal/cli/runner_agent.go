@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"io/ioutil"
 	"net"
 	"time"
@@ -133,7 +134,13 @@ func (c *RunnerAgentCommand) Run(args []string) int {
 			for {
 				conn, err := ln.Accept()
 				if err != nil {
-					log.Warn("error accepting liveness connection: %s", err)
+					log.Warn("error accepting liveness connection", "err", err)
+					if errors.Is(err, net.ErrClosed) {
+						log.Warn("liveness server exiting")
+						return
+					}
+
+					continue
 				}
 
 				// Immediately close. The liveness check only ensures a
@@ -190,7 +197,7 @@ func (c *RunnerAgentCommand) Run(args []string) int {
 }
 
 func (c *RunnerAgentCommand) Flags() *flag.Sets {
-	return c.flagSet(flagSetOperation, func(set *flag.Sets) {
+	return c.flagSet(0, func(set *flag.Sets) {
 		f := set.NewSet("Command Options")
 		f.BoolVar(&flag.BoolVar{
 			Name:   "enable-dynamic-config",

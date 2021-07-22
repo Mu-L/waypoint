@@ -270,6 +270,22 @@ jsonencode(val) string
 
 encode the given HCL value as json
 
+## `jsonnetdir`
+
+```hcl
+jsonnetdir(dir, options) dynamic
+```
+
+convert a directory of Jsonnet files into JSON, returning a path
+
+## `jsonnetfile`
+
+```hcl
+jsonnetfile(path, options) dynamic
+```
+
+convert a Jsonnet file into JSON, returning a file path
+
 ## `keys`
 
 ```hcl
@@ -461,6 +477,12 @@ timeadd(timestamp, duration) string
 ```
 
 add a quantum of time to the given timestamp to calculate a new timestamp
+
+## `timestamp`
+
+```hcl
+timestamp() string
+```
 
 ## `title`
 

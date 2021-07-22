@@ -26,22 +26,36 @@ Router.map(function () {
     this.route('connect');
     this.route('start');
   });
-  this.route('workspaces', { path: '/' });
+  this.route('workspaces', { path: '/' }, function () {
+    this.route('projects', function () {
+      this.route('project');
+    });
+  });
   this.route('workspace', { path: '/:workspace_id' }, function () {
     this.route('projects', { path: '/' }, function () {
       this.route('project', { path: '/:project_id' }, function () {
-        this.route('apps');
+        this.route('apps', function () {
+          this.route('new');
+        });
         this.route('app', { path: '/app/:app_id' }, function () {
           this.route('builds');
-          this.route('build', { path: '/build/:build_id' });
+          this.route('build-id', { path: '/build/:build_id' });
+          this.route('build', { path: '/build/seq/:sequence' });
           this.route('deployments');
-          this.route('deployment', { path: '/deployment/:deployment_id' });
+          this.route('deployment-id', { path: '/deployment/:deployment_id' });
+          this.route('deployment', { path: '/deployment/seq/:sequence' });
           this.route('releases');
-          this.route('release', { path: '/release/:release_id' });
+          this.route('release-id', { path: '/release/:release_id' });
+          this.route('release', { path: '/release/seq/:sequence' });
           this.route('logs');
           this.route('exec');
         });
+        this.route('settings', function () {
+          this.route('repository', { path: '/' });
+          this.route('variables');
+        });
       });
+      this.route('new');
     });
   });
 });

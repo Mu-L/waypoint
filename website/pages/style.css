@@ -3,15 +3,11 @@
 @import '~@hashicorp/mktg-global-styles/_temporary-to-remove/layout.css';
 @import '~@hashicorp/mktg-global-styles/_temporary-to-remove/tables.css';
 
-/* Code Highlighting */
-@import '~@hashicorp/nextjs-scripts/prism/style.css';
-
 /* Global Components */
 @import '~@hashicorp/react-button/styles/index.css';
 @import '~@hashicorp/react-consent-manager/style.css';
 @import '~@hashicorp/react-toggle/style.css';
 @import '~@hashicorp/react-vertical-text-block-list/style.css';
-@import '~@hashicorp/react-docs-sidenav/style.css';
 @import '~@hashicorp/react-search/style.css';
 @import '~@hashicorp/react-content/style.css';
 @import '~@hashicorp/react-subnav/style.css';
@@ -22,19 +18,6 @@
 
 /* Print Styles */
 @import './print.css';
-
-/*
- * Define a temporary link color as we determine the right
- * color to have an appropriate amount of contrast between the
- * background & the rest of the content.
- *
- * This color is not officially blessed by the design team,
- * and is just a reasonable color picked w/ 3:1 contrast against
- * a white background.
- */
-:root {
-  --link-color: #13acae;
-}
 
 /*
  * About this selector:

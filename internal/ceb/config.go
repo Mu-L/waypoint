@@ -2,9 +2,13 @@ package ceb
 
 import (
 	"context"
+	"io/ioutil"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -106,19 +110,20 @@ func (ceb *CEB) watchConfig(
 	// and support automatically reinitializing if the URL service changes.
 	didInitURL := false
 
-	// env stores the currently known list of environment vars we set on the
+	// appCfg stores the currently known application configuration (which includes
+	// a list of environment vars and config files) we set on the
 	// child. We need to store this since we want to launch all exec sessions
-	// with the latest/current view on env vars too.
-	var env []string
+	// with the latest/current view on appCfg vars too.
+	var appCfg *appconfig.UpdatedConfig
 
 	// Start the app config watcher. This runs in its own goroutine so that
 	// stuff like dynamic config fetching doesn't block starting things like
 	// exec sessions.
-	envCh := make(chan []string)
+	appCfgCh := make(chan *appconfig.UpdatedConfig)
 	w, err := appconfig.NewWatcher(
 		appconfig.WithLogger(log),
 		appconfig.WithPlugins(ceb.configPlugins),
-		appconfig.WithNotify(envCh),
+		appconfig.WithNotify(appCfgCh),
 		appconfig.WithRefreshInterval(appConfigRefreshPeriod),
 	)
 	if err != nil {
@@ -154,8 +159,11 @@ func (ceb *CEB) watchConfig(
 
 			// Start the exec sessions if we have any
 			if len(config.Exec) > 0 {
-				ceb.startExecGroup(config.Exec, env)
+				ceb.startExecGroup(config.Exec, appCfg.EnvVars)
 			}
+
+			// Respect any value sent down right away.
+			cfg.FileRewriteSignal = config.FileChangeSignal
 
 			// Configure our env vars for the child command. We always send
 			// these even if they're nil since the app config watcher will
@@ -163,15 +171,30 @@ func (ceb *CEB) watchConfig(
 			w.UpdateSources(ctx, config.ConfigSources)
 			w.UpdateVars(ctx, config.EnvVars)
 
-		case newEnv := <-envCh:
+		case newEnv := <-appCfgCh:
 			// Store the new env vars. We could just do `env = <-envCh` above
 			// but in my experience its super easy in the future for someone
 			// to put a `:=` there and break things. This makes it more explicit.
-			env = newEnv
+			appCfg = newEnv
+
+			log.Trace("received new config")
+
+			if appCfg.UpdatedFiles && len(appCfg.Files) > 0 {
+				ceb.writeFiles(log, cfg, appCfg)
+			}
+
+			if !appCfg.UpdatedEnv {
+				log.Trace("updated env did not include new env vars, skipping restart")
+				continue
+			}
+
+			// Process it for any keys that we handle differently (such as
+			// WAYPOINT_LOG_LEVEL)
+			ceb.processAppEnv(appCfg.EnvVars)
 
 			// Set our new env vars
 			newCmd := ceb.copyCmd(ceb.childCmdBase)
-			newCmd.Env = append(newCmd.Env, env...)
+			newCmd.Env = append(newCmd.Env, appCfg.EnvVars...)
 
 			// Restart
 			log.Info("env vars changed, sending new child command")
@@ -184,6 +207,82 @@ func (ceb *CEB) watchConfig(
 			// a noop if its already done. If its not, then we're ready now
 			// because readiness is waiting for that initial set of config.
 			ceb.markChildCmdReady()
+		}
+	}
+}
+
+var sigMap = map[string]os.Signal{
+	"SIGABRT":   unix.SIGABRT,
+	"SIGALRM":   unix.SIGALRM,
+	"SIGBUS":    unix.SIGBUS,
+	"SIGCHLD":   unix.SIGCHLD,
+	"SIGCONT":   unix.SIGCONT,
+	"SIGHUP":    unix.SIGHUP,
+	"SIGINT":    unix.SIGINT,
+	"SIGIO":     unix.SIGIO,
+	"SIGKILL":   unix.SIGKILL,
+	"SIGPIPE":   unix.SIGPIPE,
+	"SIGPROF":   unix.SIGPROF,
+	"SIGQUIT":   unix.SIGQUIT,
+	"SIGSEGV":   unix.SIGSEGV,
+	"SIGSTOP":   unix.SIGSTOP,
+	"SIGSYS":    unix.SIGSYS,
+	"SIGTERM":   unix.SIGTERM,
+	"SIGTRAP":   unix.SIGTRAP,
+	"SIGTSTP":   unix.SIGTSTP,
+	"SIGTTIN":   unix.SIGTTIN,
+	"SIGTTOU":   unix.SIGTTOU,
+	"SIGUSR1":   unix.SIGUSR1,
+	"SIGUSR2":   unix.SIGUSR2,
+	"SIGVTALRM": unix.SIGVTALRM,
+	"SIGWINCH":  unix.SIGWINCH,
+
+	"ABRT":   unix.SIGABRT,
+	"ALRM":   unix.SIGALRM,
+	"BUS":    unix.SIGBUS,
+	"CHLD":   unix.SIGCHLD,
+	"CONT":   unix.SIGCONT,
+	"HUP":    unix.SIGHUP,
+	"INT":    unix.SIGINT,
+	"IO":     unix.SIGIO,
+	"KILL":   unix.SIGKILL,
+	"PIPE":   unix.SIGPIPE,
+	"PROF":   unix.SIGPROF,
+	"QUIT":   unix.SIGQUIT,
+	"SEGV":   unix.SIGSEGV,
+	"STOP":   unix.SIGSTOP,
+	"SYS":    unix.SIGSYS,
+	"TERM":   unix.SIGTERM,
+	"TRAP":   unix.SIGTRAP,
+	"TSTP":   unix.SIGTSTP,
+	"TTIN":   unix.SIGTTIN,
+	"TTOU":   unix.SIGTTOU,
+	"USR1":   unix.SIGUSR1,
+	"USR2":   unix.SIGUSR2,
+	"VTALRM": unix.SIGVTALRM,
+	"WINCH":  unix.SIGWINCH,
+}
+
+func (ceb *CEB) writeFiles(log hclog.Logger, cfg *config, env *appconfig.UpdatedConfig) {
+	log.Debug("writing application files to disk", "count", len(env.Files))
+
+	var sendSignal bool
+
+	for _, fc := range env.Files {
+		err := ioutil.WriteFile(fc.Path, fc.Data, 0644)
+		if err != nil {
+			log.Error("error writing application file", "error", err, "path", fc.Path)
+		} else {
+			log.Info("wrote application file to disk", "path", fc.Path)
+			sendSignal = true
+		}
+	}
+
+	if sendSignal && cfg.FileRewriteSignal != "" {
+		if sig, ok := sigMap[strings.ToUpper(cfg.FileRewriteSignal)]; ok {
+			ceb.childSigCh <- sig
+		} else {
+			log.Error("unknown signal defined for file restart", "signal", cfg.FileRewriteSignal)
 		}
 	}
 }
@@ -237,5 +336,34 @@ func (ceb *CEB) recvConfig(
 
 		log.Debug("new configuration received")
 		ch <- resp.Config
+	}
+}
+
+// processAppEnv takes a list of env vars meant for the app and handles
+// certain special cases (such as WAYPOINT_LOG_LEVEL) that also affect the
+// entrypoint.
+func (ceb *CEB) processAppEnv(env []string) {
+	// Check if we changed our log level. We change this on the
+	// root logger for the CEB.
+	for _, pair := range env {
+		idx := strings.Index(pair, "=")
+		if idx == -1 {
+			// Shouldn't happen
+			continue
+		}
+
+		key := pair[:idx]
+		if key == envLogLevel {
+			value := pair[idx+1:]
+			level := hclog.LevelFromString(value)
+			if level == hclog.NoLevel {
+				// We warn this
+				ceb.logger.Warn("log level provided in env var is invalid", value)
+			} else {
+				// We set the log level on the root logger so it
+				// affects all CEB logs.
+				ceb.logger.SetLevel(level)
+			}
+		}
 	}
 }

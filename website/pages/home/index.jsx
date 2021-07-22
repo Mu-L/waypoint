@@ -5,8 +5,8 @@ import HomepageSection from 'components/homepage-section'
 import HomepageHero from 'components/homepage-hero'
 import BrandedCta from 'components/branded-cta'
 import WaypointDiagram from 'components/waypoint-diagram'
-import Features from 'components/features'
-import Terminal from '@hashicorp/react-command-line-terminal'
+import Features from '@hashicorp/react-stepped-feature-list'
+import Terminal from 'components/terminal'
 
 const loadingDots = ['', '.', '. .', '. . .']
 const spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
@@ -240,10 +240,6 @@ export default function HomePage() {
                   alt: 'Nomad',
                 },
                 {
-                  url: require('./img/step-logos/netlify.svg'),
-                  alt: 'Netlify',
-                },
-                {
                   url: require('./img/step-logos/amazon-ecs.svg'),
                   alt: 'Amazon ECS',
                 },
@@ -433,7 +429,6 @@ export default function HomePage() {
               learnMoreLink: '/docs/logs',
               content: (
                 <Terminal
-                  theme="waypoint"
                   lines={[
                     { code: '$ waypoint logs' },
                     {
@@ -472,7 +467,6 @@ export default function HomePage() {
               learnMoreLink: '/docs/exec',
               content: (
                 <Terminal
-                  theme="waypoint"
                   lines={[
                     { code: '$ waypoint exec bash' },
                     {
@@ -494,7 +488,6 @@ export default function HomePage() {
               learnMoreLink: '/docs/url',
               content: (
                 <Terminal
-                  theme="waypoint"
                   lines={[
                     { code: '$ waypoint deploy' },
                     { code: '' },
@@ -537,8 +530,11 @@ export default function HomePage() {
                 'View projects and applications being deployed by Waypoint in a web interface',
               content: (
                 <img
-                  style={{ border: '1px solid rgba(174,176,183,.45)' }}
-                  src={require('./img/web-ui.png')}
+                  style={{
+                    height: '500px',
+                    width: 'auto',
+                  }}
+                  src={require('./img/waypoint_ui@3x.png')}
                   alt="Web UI"
                 />
               ),
@@ -550,7 +546,6 @@ export default function HomePage() {
               learnMoreLink: '/docs/automating-execution',
               content: (
                 <Terminal
-                  theme="waypoint"
                   title="config.yaml"
                   lines={[
                     {
@@ -605,7 +600,6 @@ export default function HomePage() {
               learnMoreLink: '/docs/extending-waypoint',
               content: (
                 <Terminal
-                  theme="waypoint"
                   title="plugin.go"
                   lines={[
                     {

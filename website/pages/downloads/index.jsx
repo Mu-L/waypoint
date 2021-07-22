@@ -1,5 +1,4 @@
 import VERSION, { packageManagers } from 'data/version.js'
-import Head from 'next/head'
 import HashiHead from '@hashicorp/react-head'
 import { productName, productSlug } from 'data/metadata'
 import ProductDownloader from '@hashicorp/react-product-downloader'
@@ -7,9 +6,8 @@ import styles from './style.module.css'
 
 export default function DownloadsPage({ releases }) {
   return (
-    <>
-      <HashiHead is={Head} title={`Downloads | ${productName} by HashiCorp`} />
-
+    <span className={styles.downloads}>
+      <HashiHead title={`Downloads | ${productName} by HashiCorp`} />
       <ProductDownloader
         releases={releases}
         packageManagers={packageManagers}
@@ -44,13 +42,13 @@ export default function DownloadsPage({ releases }) {
             src={require('./img/waypoint-logo.svg')}
           />
         }
-        brand="waypoint"
+        product="waypoint"
         tutorialLink={{
           href: 'https://learn.hashicorp.com/waypoint',
           label: 'View Tutorials at HashiCorp Learn',
         }}
       />
-    </>
+    </span>
   )
 }
 

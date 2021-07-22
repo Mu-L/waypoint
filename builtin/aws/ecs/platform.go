@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/elbv2"
 	"github.com/aws/aws-sdk-go/service/iam"
 	"github.com/aws/aws-sdk-go/service/route53"
+	validation "github.com/go-ozzo/ozzo-validation/v4"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/waypoint-plugin-sdk/component"
 	"github.com/hashicorp/waypoint-plugin-sdk/docs"
@@ -32,6 +33,62 @@ type Platform struct {
 // Config implements Configurable
 func (p *Platform) Config() (interface{}, error) {
 	return &p.config, nil
+}
+
+// ConfigSet is called after a configuration has been decoded
+// we can use this to validate the config
+func (p *Platform) ConfigSet(config interface{}) error {
+	c, ok := config.(*Config)
+	if !ok {
+		// this should never happen
+		return fmt.Errorf("Invalid configuration, expected *cloudrun.Config, got %T", config)
+	}
+
+	if c.ALB != nil {
+		alb := c.ALB
+		err := utils.Error(validation.ValidateStruct(alb,
+			validation.Field(&alb.CertificateId,
+				validation.Empty.When(alb.ListenerARN != "").Error("certificate can not be used with listener_arn"),
+			),
+			validation.Field(&alb.ZoneId,
+				validation.Empty.When(alb.ListenerARN != ""),
+				validation.Required.When(alb.FQDN != ""),
+			),
+			validation.Field(&alb.FQDN,
+				validation.Empty.When(alb.ListenerARN != ""),
+				validation.Required.When(alb.ZoneId != "").Error("fqdn only valid with zone_id"),
+			),
+			validation.Field(&alb.InternalScheme,
+				validation.Nil.When(alb.ListenerARN != "").Error("internal can not be used with listener_arn"),
+			),
+			validation.Field(&alb.ListenerARN,
+				validation.Empty.When(alb.CertificateId != "" || alb.ZoneId != "" || alb.FQDN != "").Error("listener_arn can not be used with other options"),
+			),
+		))
+		if err != nil {
+			return err
+		}
+	}
+
+	err := utils.Error(validation.ValidateStruct(c,
+		validation.Field(&c.Memory, validation.Required, validation.Min(4)),
+		validation.Field(&c.MemoryReservation, validation.Min(4), validation.Max(c.Memory)),
+	))
+	if err != nil {
+		return err
+	}
+
+	for _, cc := range c.ContainersConfig {
+		err := utils.Error(validation.ValidateStruct(cc,
+			validation.Field(&cc.Memory, validation.Required, validation.Min(4)),
+			validation.Field(&cc.MemoryReservation, validation.Min(4), validation.Max(cc.Memory)),
+		))
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // DeployFunc implements component.Platform
@@ -228,6 +285,7 @@ func (p *Platform) Deploy(
 		Init: func(s LifecycleStatus) error {
 			sess, err = utils.GetSession(&utils.SessionConfig{
 				Region: p.config.Region,
+				Logger: log,
 			})
 			if err != nil {
 				return err
@@ -283,7 +341,6 @@ func defaultSubnets(ctx context.Context, sess *session.Session) ([]*string, erro
 			},
 		},
 	})
-
 	if err != nil {
 		return nil, err
 	}
@@ -308,7 +365,6 @@ func (p *Platform) SetupCluster(ctx context.Context, s LifecycleStatus, sess *se
 	desc, err := ecsSvc.DescribeClusters(&ecs.DescribeClustersInput{
 		Clusters: []*string{aws.String(cluster)},
 	})
-
 	if err != nil {
 		return "", err
 	}
@@ -407,6 +463,7 @@ func (p *Platform) SetupExecutionRole(ctx context.Context, s LifecycleStatus, L 
 	// role names have to be 64 characters or less, and the client side doesn't validate this.
 	if len(roleName) > 64 {
 		roleName = roleName[:64]
+		L.Debug("using a shortened value for role name due to AWS's length limits", "roleName", roleName)
 	}
 
 	// p.updateStatus("setting up IAM role")
@@ -469,7 +526,6 @@ func (p *Platform) SetupLogs(ctx context.Context, s LifecycleStatus, L hclog.Log
 		Limit:              aws.Int64(1),
 		LogGroupNamePrefix: aws.String(logGroup),
 	})
-
 	if err != nil {
 		return "", err
 	}
@@ -489,7 +545,6 @@ func (p *Platform) SetupLogs(ctx context.Context, s LifecycleStatus, L hclog.Log
 	}
 
 	return logGroup, nil
-
 }
 
 func createSG(
@@ -510,7 +565,6 @@ func createSG(
 			},
 		},
 	})
-
 	if err != nil {
 		return nil, err
 	}
@@ -669,10 +723,17 @@ func createALB(
 		} else {
 			s.Update("Creating new ALB: %s", lbName)
 
+			scheme := elbv2.LoadBalancerSchemeEnumInternetFacing
+
+			if albConfig != nil && albConfig.InternalScheme != nil && *albConfig.InternalScheme {
+				scheme = elbv2.LoadBalancerSchemeEnumInternal
+			}
+
 			clb, err := elbsrv.CreateLoadBalancer(&elbv2.CreateLoadBalancerInput{
 				Name:           aws.String(lbName),
 				Subnets:        subnets,
 				SecurityGroups: []*string{sgWebId},
+				Scheme:         &scheme,
 			})
 			if err != nil {
 				return nil, nil, err
@@ -713,7 +774,6 @@ func createALB(
 					},
 				},
 			})
-
 			if err != nil {
 				return nil, nil, err
 			}
@@ -766,7 +826,7 @@ func createALB(
 		records, err := r53.ListResourceRecordSets(&route53.ListResourceRecordSetsInput{
 			HostedZoneId:    aws.String(albConfig.ZoneId),
 			StartRecordName: aws.String(albConfig.FQDN),
-			StartRecordType: aws.String("A"),
+			StartRecordType: aws.String(route53.RRTypeA),
 			MaxItems:        aws.String("1"),
 		})
 		if err != nil {
@@ -775,14 +835,23 @@ func createALB(
 
 		fqdn := albConfig.FQDN
 
+		// Add trailing period to match Route53 record name
 		if fqdn[len(fqdn)-1] != '.' {
 			fqdn += "."
 		}
 
-		if len(records.ResourceRecordSets) > 0 && *(records.ResourceRecordSets[0].Name) == fqdn {
-			s.Status("Found existing Route53 record: %s", *records.ResourceRecordSets[0].Name)
-			L.Debug("found existing record, assuming it's correct")
-		} else {
+		var recordExists bool
+
+		if len(records.ResourceRecordSets) > 0 {
+			record := records.ResourceRecordSets[0]
+			if aws.StringValue(record.Type) == route53.RRTypeA && aws.StringValue(record.Name) == fqdn {
+				s.Status("Found existing Route53 record: %s", aws.StringValue(record.Name))
+				L.Debug("found existing record, assuming it's correct")
+				recordExists = true
+			}
+		}
+
+		if !recordExists {
 			s.Status("Creating new Route53 record: %s (zone-id: %s)",
 				albConfig.FQDN, albConfig.ZoneId)
 
@@ -791,10 +860,10 @@ func createALB(
 				ChangeBatch: &route53.ChangeBatch{
 					Changes: []*route53.Change{
 						{
-							Action: aws.String("CREATE"),
+							Action: aws.String(route53.ChangeActionCreate),
 							ResourceRecordSet: &route53.ResourceRecordSet{
 								Name: aws.String(albConfig.FQDN),
-								Type: aws.String("A"),
+								Type: aws.String(route53.RRTypeA),
 								AliasTarget: &route53.AliasTarget{
 									DNSName:              lb.DNSName,
 									EvaluateTargetHealth: aws.Bool(true),
@@ -929,8 +998,10 @@ func (p *Platform) Launch(
 				ContainerPort: aws.Int64(p.config.ServicePort),
 			},
 		},
-		Environment: env,
-		Secrets:     secrets,
+		Environment:       env,
+		Memory:            utils.OptionalInt64(int64(p.config.Memory)),
+		MemoryReservation: utils.OptionalInt64(int64(p.config.MemoryReservation)),
+		Secrets:           secrets,
 		LogConfiguration: &ecs.LogConfiguration{
 			LogDriver: aws.String("awslogs"),
 			Options:   logOptions,
@@ -961,8 +1032,8 @@ func (p *Platform) Launch(
 			Image:     aws.String(container.Image),
 			PortMappings: []*ecs.PortMapping{
 				{
-					ContainerPort: aws.Int64(container.ContainerPort),
-					HostPort:      aws.Int64(container.HostPort),
+					ContainerPort: aws.Int64(int64(container.ContainerPort)),
+					HostPort:      aws.Int64(int64(container.HostPort)),
 					Protocol:      aws.String(container.Protocol),
 				},
 			},
@@ -973,8 +1044,10 @@ func (p *Platform) Launch(
 				Retries:     aws.Int64(container.HealthCheck.Retries),
 				StartPeriod: aws.Int64(container.HealthCheck.StartPeriod),
 			},
-			Secrets:     secrets,
-			Environment: env,
+			Secrets:           secrets,
+			Environment:       env,
+			Memory:            utils.OptionalInt64(int64(container.Memory)),
+			MemoryReservation: utils.OptionalInt64(int64(container.MemoryReservation)),
 		}
 
 		additionalContainers = append(additionalContainers, c)
@@ -983,58 +1056,26 @@ func (p *Platform) Launch(
 	L.Debug("registering task definition", "id", id)
 
 	var cpuShares int
+	family := "waypoint-" + app.App
+
+	s.Status("Registering Task definition: %s", family)
 
 	runtime := aws.String("FARGATE")
 	if p.config.EC2Cluster {
 		runtime = aws.String("EC2")
 		cpuShares = p.config.CPU
 	} else {
-		if p.config.Memory == 0 {
-			return nil, fmt.Errorf("Memory value required for fargate")
-		}
-		cpuValues, ok := fargateResources[p.config.Memory]
-		if !ok {
-			var (
-				allValues  []int
-				goodValues []string
-			)
-
-			for k := range fargateResources {
-				allValues = append(allValues, k)
-			}
-
-			sort.Ints(allValues)
-
-			for _, k := range allValues {
-				goodValues = append(goodValues, strconv.Itoa(k))
-			}
-
-			return nil, fmt.Errorf("Invalid memory value: %d (valid values: %s)",
-				p.config.Memory, strings.Join(goodValues, ", "))
+		if err := utils.ValidateEcsMemCPUPair(p.config.Memory, p.config.CPU); err != nil {
+			return nil, err
 		}
 
-		if p.config.CPU == 0 {
+		cpuValues := fargateResources[p.config.Memory]
+
+		// at this point we know that config.CPU is either 0, or a valid value
+		// for the memory given
+		cpuShares = p.config.CPU
+		if cpuShares == 0 {
 			cpuShares = cpuValues[0]
-		} else {
-			var (
-				valid      bool
-				goodValues []string
-			)
-
-			for _, c := range cpuValues {
-				goodValues = append(goodValues, strconv.Itoa(c))
-				if c == p.config.CPU {
-					valid = true
-					break
-				}
-			}
-
-			if !valid {
-				return nil, fmt.Errorf("Invalid cpu value: %d (valid values: %s)",
-					p.config.Memory, strings.Join(goodValues, ", "))
-			}
-
-			cpuShares = p.config.CPU
 		}
 	}
 
@@ -1044,10 +1085,6 @@ func (p *Platform) Launch(
 		cpus = nil
 	}
 	mems := strconv.Itoa(p.config.Memory)
-
-	family := "waypoint-" + app.App
-
-	s.Status("Registering Task definition: %s", family)
 
 	containerDefinitions := append([]*ecs.ContainerDefinition{&def}, additionalContainers...)
 
@@ -1074,7 +1111,29 @@ func (p *Platform) Launch(
 		registerTaskDefinitionInput.SetTaskRoleArn(taskRoleArn)
 	}
 
-	taskOut, err := ecsSvc.RegisterTaskDefinition(&registerTaskDefinitionInput)
+	var taskOut *ecs.RegisterTaskDefinitionOutput
+
+	// AWS is eventually consistent so even though we probably created the resources that
+	// are referenced by the task definition, it can error out if we try to reference those resources
+	// too quickly. So we're forced to guard actions which reference other AWS services
+	// with loops like this.
+	for i := 0; i < 30; i++ {
+		taskOut, err = ecsSvc.RegisterTaskDefinition(&registerTaskDefinitionInput)
+		if err == nil {
+			break
+		}
+
+		// if we encounter an unrecoverable error, exit now.
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			case "ResourceConflictException":
+				return nil, err
+			}
+		}
+
+		// otherwise sleep and try again
+		time.Sleep(2 * time.Second)
+	}
 
 	if err != nil {
 		return nil, err
@@ -1088,6 +1147,7 @@ func (p *Platform) Launch(
 	// requires that the name is 32 characters or less.
 	if len(serviceName) > 32 {
 		serviceName = serviceName[:32]
+		L.Debug("using a shortened value for service name due to AWS's length limits", "serviceName", serviceName)
 	}
 
 	taskArn := *taskOut.TaskDefinition.TaskDefinitionArn
@@ -1185,7 +1245,32 @@ func (p *Platform) Launch(
 	}
 
 	s.Status("Creating ECS Service (%s, cluster-name: %s)", serviceName, clusterName)
-	servOut, err := ecsSvc.CreateService(createServiceInput)
+
+	var servOut *ecs.CreateServiceOutput
+
+	// AWS is eventually consistent so even though we probably created the resources that
+	// are referenced by the service, it can error out if we try to reference those resources
+	// too quickly. So we're forced to guard actions which reference other AWS services
+	// with loops like this.
+	for i := 0; i < 30; i++ {
+		servOut, err = ecsSvc.CreateService(createServiceInput)
+		if err == nil {
+			break
+		}
+
+		// if we encounter an unrecoverable error, exit now.
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			case "AccessDeniedException", "UnsupportedFeatureException",
+				"PlatformUnknownException",
+				"PlatformTaskDefinitionIncompatibilityException":
+				return nil, err
+			}
+		}
+
+		// otherwise sleep and try again
+		time.Sleep(2 * time.Second)
+	}
 
 	if err != nil {
 		return nil, err
@@ -1311,6 +1396,7 @@ func (p *Platform) Destroy(
 ) error {
 	sess, err := utils.GetSession(&utils.SessionConfig{
 		Region: p.config.Region,
+		Logger: log,
 	})
 	if err != nil {
 		return err
@@ -1339,17 +1425,21 @@ func (p *Platform) Destroy(
 
 type ALBConfig struct {
 	// Certificate ARN to attach to the load balancer
-	CertificateId string `hcl:"certificate"`
+	CertificateId string `hcl:"certificate,optional"`
 
 	// Route53 Zone to setup record in
-	ZoneId string `hcl:"zone_id"`
+	ZoneId string `hcl:"zone_id,optional"`
 
 	// Fully qualified domain name of the record to create in the target zone id
-	FQDN string `hcl:"domain_name"`
+	FQDN string `hcl:"domain_name,optional"`
 
 	// When set, waypoint will configure the target group into the specified
 	// ALB Listener ARN. This allows for usage of existing ALBs.
 	ListenerARN string `hcl:"listener_arn,optional"`
+
+	// Indicates, when creating an ALB, that it should be internal rather than
+	// internet facing.
+	InternalScheme *bool `hcl:"internal,optional"`
 }
 
 type HealthCheckConfig struct {
@@ -1391,16 +1481,16 @@ type ContainerConfig struct {
 	Image string `hcl:"image"`
 
 	// The amount (in MiB) of memory to present to the container
-	Memory string `hcl:"memory,optional"`
+	Memory int `hcl:"memory,optional"`
 
 	// The soft limit (in MiB) of memory to reserve for the container
-	MemoryReservation string `hcl:"memory_reservation,optional"`
+	MemoryReservation int `hcl:"memory_reservation,optional"`
 
 	// The port number on the container
-	ContainerPort int64 `hcl:"container_port,optional"`
+	ContainerPort int `hcl:"container_port,optional"`
 
 	// The port number on the container instance to reserve for your container
-	HostPort int64 `hcl:"host_port,optional"`
+	HostPort int `hcl:"host_port,optional"`
 
 	// The protocol used for the port mapping
 	Protocol string `hcl:"protocol,optional"`
@@ -1439,6 +1529,9 @@ type Config struct {
 
 	// How much memory to assign to the containers
 	Memory int `hcl:"memory"`
+
+	// The soft limit (in MiB) of memory to reserve for the container
+	MemoryReservation int `hcl:"memory_reservation,optional"`
 
 	// How much CPU to assign to the containers
 	CPU int `hcl:"cpu,optional"`
@@ -1574,81 +1667,99 @@ deploy {
 	)
 
 	doc.SetField(
-		"alb.certificate",
-		"the ARN of an AWS Certificate Manager cert to associate with the ALB",
-	)
+		"alb",
+		"Provides additional configuration for using an ALB with ECS",
+		docs.SubFields(func(doc *docs.SubFieldDoc) {
+			doc.SetField(
+				"certificate",
+				"the ARN of an AWS Certificate Manager cert to associate with the ALB",
+			)
 
-	doc.SetField(
-		"alb.zone_id",
-		"Route53 ZoneID to create a DNS record into",
-		docs.Summary(
-			"set along with alb.domain_name to have DNS automatically setup for the ALB",
-		),
-	)
+			doc.SetField(
+				"zone_id",
+				"Route53 ZoneID to create a DNS record into",
+				docs.Summary(
+					"set along with alb.domain_name to have DNS automatically setup for the ALB",
+				),
+			)
 
-	doc.SetField(
-		"alb.domain_name",
-		"Fully qualified domain name to set for the ALB",
-		docs.Summary(
-			"set along with zone_id to have DNS automatically setup for the ALB.",
-			"this value should include the full hostname and domain name, for instance",
-			"app.example.com",
-		),
-	)
+			doc.SetField(
+				"domain_name",
+				"Fully qualified domain name to set for the ALB",
+				docs.Summary(
+					"set along with zone_id to have DNS automatically setup for the ALB.",
+					"this value should include the full hostname and domain name, for instance",
+					"app.example.com",
+				),
+			)
 
-	doc.SetField(
-		"alb.listener_arn",
-		"the ARN on an existing ALB to configure",
-		docs.Summary(
-			"when this is set, no ALB or Listener is created. Instead the application is",
-			"configured by manipulating this existing Listener. This allows users to",
-			"configure their ALB outside waypoint but still have waypoint hook the application",
-			"to that ALB",
-		),
+			doc.SetField(
+				"internal",
+				"Whether or not the created ALB should be internal",
+				docs.Summary(
+					"used when listener_arn is not set. If set, the created ALB will have a scheme",
+					"of `internal`, otherwise by default it has a scheme of `internet-facing`.",
+				),
+			)
+
+			doc.SetField(
+				"listener_arn",
+				"the ARN on an existing ALB to configure",
+				docs.Summary(
+					"when this is set, no ALB or Listener is created. Instead the application is",
+					"configured by manipulating this existing Listener. This allows users to",
+					"configure their ALB outside waypoint but still have waypoint hook the application",
+					"to that ALB",
+				),
+			)
+		}),
 	)
 
 	doc.SetField(
 		"logging",
 		"Provides additional configuration for logging flags for ECS",
-		docs.Summary("Part of the ecs task definition.  These configuration flags help",
+		docs.Summary(
+			"Part of the ecs task definition.  These configuration flags help",
 			"control how the awslogs log driver is configured."),
-	)
 
-	doc.SetField(
-		"logging.create_group",
-		"Enables creation of the aws logs group if not present",
-	)
+		docs.SubFields(func(doc *docs.SubFieldDoc) {
+			doc.SetField(
+				"create_group",
+				"Enables creation of the aws logs group if not present",
+			)
 
-	doc.SetField(
-		"logging.region",
-		"The region the logs are to be shipped to",
-		docs.Default("The same region the task is to be running"),
-	)
+			doc.SetField(
+				"region",
+				"The region the logs are to be shipped to",
+				docs.Default("The same region the task is to be running"),
+			)
 
-	doc.SetField(
-		"logging.stream_prefix",
-		"Prefix for application in cloudwatch logs path",
-		docs.Default("Generated based off timestamp"),
-	)
+			doc.SetField(
+				"stream_prefix",
+				"Prefix for application in cloudwatch logs path",
+				docs.Default("Generated based off timestamp"),
+			)
 
-	doc.SetField(
-		"logging.datetime_format",
-		"Defines the multiline start pattern in Python strftime format",
-	)
+			doc.SetField(
+				"datetime_format",
+				"Defines the multiline start pattern in Python strftime format",
+			)
 
-	doc.SetField(
-		"logging.multiline_pattern",
-		"Defines the multiline start pattern using a regular expression",
-	)
+			doc.SetField(
+				"multiline_pattern",
+				"Defines the multiline start pattern using a regular expression",
+			)
 
-	doc.SetField(
-		"logging.mode",
-		"Delivery method for log messages, either 'blocking' or 'non-blocking'",
-	)
+			doc.SetField(
+				"mode",
+				"Delivery method for log messages, either 'blocking' or 'non-blocking'",
+			)
 
-	doc.SetField(
-		"logging.max_buffer_size",
-		"When using non-blocking logging mode, this is the buffer size for message storage",
+			doc.SetField(
+				"max_buffer_size",
+				"When using non-blocking logging mode, this is the buffer size for message storage",
+			)
+		}),
 	)
 
 	doc.SetField(
